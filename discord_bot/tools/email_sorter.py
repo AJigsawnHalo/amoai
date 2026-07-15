@@ -5,9 +5,9 @@ def sort_emails() -> str:
     Triggers the email sorting process and returns the logs to the user.
     Use this tool whenever the user asks to sort, check, or clean their emails.
     """
-    venv_python = "/home/elskiee/.almond/.venv/bin/python"
+    venv_python = "/home/elskiee/.amoai/.venv/bin/python"
     # Assuming you want to trigger the logic-based script, not the infinite loop monitor
-    script_path = "/home/elskiee/.almond/email-monitor/monitor.py"
+    script_path = "/home/elskiee/.amoai/email-monitor/monitor.py"
 
     try:
         result = subprocess.run(
