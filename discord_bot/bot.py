@@ -1,10 +1,13 @@
 import os
 import sys
+import asyncio
+import json
 import importlib
 import pkgutil
 import inspect
 import requests
 import discord
+from pathlib import Path
 from collections import defaultdict, deque
 from discord.ext import commands
 from dotenv import load_dotenv, find_dotenv
@@ -70,6 +73,79 @@ def register_tools():
 # Initialize and register tools
 register_tools()
 
+# --- PERSISTENT USER MEMORY ---
+# Durable, cross-restart facts about each user, keyed by Discord user ID.
+# Separate from CHANNEL_HISTORY, which is short-term/in-session only.
+MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
+MAX_FACTS_PER_USER = 40  # keep the store from growing unbounded
+
+def load_all_memory() -> dict:
+    if not MEMORY_FILE.exists():
+        return {}
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_all_memory(data: dict):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"[MEMORY] Failed to save memory store: {e}")
+
+def get_user_facts(user_id: str) -> list:
+    return load_all_memory().get(str(user_id), [])
+
+def add_user_facts(user_id: str, new_facts: list):
+    if not new_facts:
+        return
+    data = load_all_memory()
+    facts = data.setdefault(str(user_id), [])
+    for fact in new_facts:
+        fact = fact.strip()
+        if fact and fact not in facts:
+            facts.append(fact)
+    data[str(user_id)] = facts[-MAX_FACTS_PER_USER:]
+    save_all_memory(data)
+
+def clear_user_facts(user_id: str):
+    data = load_all_memory()
+    if str(user_id) in data:
+        del data[str(user_id)]
+        save_all_memory(data)
+
+async def extract_and_store_facts(user_id: str, user_query: str):
+    """Fire-and-forget: ask the model whether this message contains any
+    durable personal fact worth remembering, and save it if so. Runs after
+    the user already has their reply, so it never adds visible latency."""
+    extraction_prompt = (
+        "Below is a single message a user sent to a Discord bot. Decide if it "
+        "contains any NEW durable fact about the user worth remembering long-term "
+        "(name, role, preferences, ongoing projects, recurring routines, etc). "
+        "Ignore one-off requests, questions, or temporary details. "
+        "Reply with ONLY a JSON array of short fact strings (no markdown, no preamble). "
+        "If there is nothing worth remembering, reply with exactly: []\n\n"
+        f"Message: {user_query}"
+    )
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": extraction_prompt}],
+        "stream": False
+    }
+    try:
+        response = requests.post(OLLAMA_API, json=payload, timeout=60).json()
+        raw = response.get("message", {}).get("content", "[]").strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        facts = json.loads(raw)
+        if isinstance(facts, list):
+            add_user_facts(user_id, [str(f) for f in facts])
+    except Exception as e:
+        print(f"[MEMORY] Extraction skipped (non-fatal): {e}")
+
 DISCORD_LIMIT = 2000
 
 async def send_chunked(channel, text: str):
@@ -107,7 +183,29 @@ async def on_message(message):
         return
 
     user_query = message.content
-    
+    user_id = str(message.author.id)
+
+    # --- Memory commands (handled directly, no LLM call) ---
+    trigger = user_query.strip().lower()
+    if trigger in ("!recall", "!memory", "!whatdoyouremember"):
+        known_facts = get_user_facts(user_id)
+        if known_facts:
+            text = "Here's what I remember about you:\n" + "\n".join(f"- {f}" for f in known_facts)
+        else:
+            text = "I don't have anything saved about you yet."
+        await send_chunked(message.channel, text)
+        return
+    if trigger in ("!forget", "!forgetme", "!clearmemory"):
+        clear_user_facts(user_id)
+        await send_chunked(message.channel, "Done — I've cleared everything I had saved about you.")
+        return
+
+    known_facts = get_user_facts(user_id)
+    facts_block = (
+        "\n\nWhat you remember about this user:\n" + "\n".join(f"- {f}" for f in known_facts)
+        if known_facts else ""
+    )
+
     # Define personality and instructions
     system_prompt = (
         "Your name is Amoai. Your nickname is Ai. Your name is based on 'Almond Eye' the legendary racehorse. "
@@ -116,7 +214,10 @@ async def on_message(message):
         "You have access to tools. Always evaluate if a user's request can be answered by using a tool "
         "before responding with text. If no tool is needed, respond as yourself. "
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
-        "ask the user a clarifying question instead of guessing or answering without checking."
+        "ask the user a clarifying question instead of guessing or answering without checking. "
+        "If the user asks what you remember, or how to clear it, tell them they can type "
+        "!recall to see saved facts or !forget to clear them."
+        + facts_block
     )
 
     messages = [
@@ -186,6 +287,7 @@ async def on_message(message):
                     await send_chunked(message.channel, response_text)
                     CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
                     CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": response_text})
+                    asyncio.create_task(extract_and_store_facts(user_id, user_query))
                     running = False
 
             if loop_count >= max_loops:
@@ -205,6 +307,7 @@ async def on_message(message):
                 await send_chunked(message.channel, summary_text)
                 CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
                 CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": summary_text})
+                asyncio.create_task(extract_and_store_facts(user_id, user_query))
 
     except Exception as e:
         await send_chunked(message.channel, f"⚠️ Error: {e}")
