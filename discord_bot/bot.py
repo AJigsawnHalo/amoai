@@ -2,14 +2,16 @@ import os
 import sys
 import asyncio
 import json
+import time
 import importlib
 import pkgutil
 import inspect
 import requests
 import discord
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict, deque
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv, find_dotenv
 import tools 
 
@@ -23,6 +25,16 @@ ALLOWED_CHANNEL_ID = int(os.getenv("ALLOWED_CHANNEL_ID", 0))
 # --- DYNAMIC REGISTRY ---
 OLLAMA_SCHEMAS = []
 TOOL_REGISTRY = {}
+
+# --- CONFIRMATION-GATED TOOLS ---
+# Tool names listed here will NOT run immediately when the model calls them.
+# Instead, the bot posts what it's about to do and waits for the requesting
+# user to react with ✅ or ❌ before executing. Use this for anything
+# consequential/destructive (sends a message, deletes a file, restarts a
+# service, spends money, etc). Empty by default — add tool names as you
+# build actions that shouldn't fire on the model's judgment alone, e.g.:
+#   CONFIRMATION_REQUIRED_TOOLS = {"send_email", "delete_file", "restart_service"}
+CONFIRMATION_REQUIRED_TOOLS = set()
 
 # --- CONVERSATION MEMORY ---
 # In-memory only (resets on restart). Keeps the last N turns per channel so
@@ -148,6 +160,76 @@ async def extract_and_store_facts(user_id: str, user_query: str):
 
 DISCORD_LIMIT = 2000
 
+# --- TOOL CALL AUDIT LOG ---
+# Append-only record of every tool invocation (LLM-triggered or scheduled),
+# so you can debug "why did it call that" or build a "what did you check
+# recently" feature later. JSONL so it's cheap to append and easy to tail.
+TOOL_LOG_FILE = Path(__file__).resolve().parent / "tool_call_log.jsonl"
+
+def log_tool_call(name: str, args: dict, result, source: str = "llm"):
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": source,       # "llm" (model-triggered) or "scheduler" (proactive)
+        "tool": name,
+        "args": args,
+        "result": str(result)[:500],  # truncate so one noisy tool can't bloat the log
+    }
+    try:
+        with open(TOOL_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[AUDIT] Failed to write tool log: {e}")
+
+# --- PROACTIVE SCHEDULER ---
+# Background jobs that can post to the channel unprompted, instead of only
+# ever responding to a message. Each job is (name, interval_seconds, func).
+# func takes no args and returns either a string (posted to the channel) or
+# None (stays silent this tick). Register more jobs with register_job().
+SCHEDULED_JOBS = []
+
+def register_job(name: str, interval_seconds: int, func):
+    SCHEDULED_JOBS.append({
+        "name": name,
+        "interval_seconds": interval_seconds,
+        "func": func,
+        "last_run": 0.0,
+    })
+
+def example_heartbeat_check():
+    """Example scheduled job — currently a no-op placeholder. Replace the body
+    with a real check (server health, a monitored feed, a due reminder, disk
+    space, etc.) and return a string when there's something worth posting.
+    Returning None keeps the bot silent for that tick."""
+    return None
+
+# Registered but harmless by default (always returns None) until you fill it in.
+# interval_seconds=3600 -> checked hourly once you add real logic.
+register_job("example_heartbeat", 3600, example_heartbeat_check)
+
+@tasks.loop(seconds=60)
+async def scheduler_tick():
+    if not ALLOWED_CHANNEL_ID:
+        return
+    channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+    if channel is None:
+        return
+
+    now = time.time()
+    for job in SCHEDULED_JOBS:
+        if now - job["last_run"] < job["interval_seconds"]:
+            continue
+        job["last_run"] = now
+        try:
+            result = job["func"]()
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception as e:
+            print(f"[SCHEDULER] Job '{job['name']}' failed: {e}")
+            continue
+        if result:
+            await send_chunked(channel, f"🕒 **{job['name']}**: {result}")
+            log_tool_call(job["name"], {}, result, source="scheduler")
+
 async def send_chunked(channel, text: str):
     """Sends text to a Discord channel, splitting into <=2000 char messages.
     Prefers to break on newlines/spaces near the limit so words aren't sliced
@@ -170,10 +252,38 @@ async def send_chunked(channel, text: str):
         await channel.send(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n ")
 
+async def confirm_with_reaction(message, prompt_text: str, timeout: int = 60) -> bool:
+    """Posts prompt_text with ✅/❌ reactions and waits for the requesting user
+    (not just anyone in the channel) to react. Returns True if confirmed,
+    False if declined or if nobody responds within timeout seconds."""
+    confirm_msg = await message.channel.send(prompt_text)
+    await confirm_msg.add_reaction("✅")
+    await confirm_msg.add_reaction("❌")
+
+    def check(reaction, user):
+        return (
+            user == message.author
+            and reaction.message.id == confirm_msg.id
+            and str(reaction.emoji) in ("✅", "❌")
+        )
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=timeout, check=check)
+        return str(reaction.emoji) == "✅"
+    except asyncio.TimeoutError:
+        await send_chunked(message.channel, "⏳ No response in time — action cancelled.")
+        return False
+
 # Initialize Bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"[SYSTEM] Logged in as {bot.user}")
+    if not scheduler_tick.is_running():
+        scheduler_tick.start()
 
 @bot.event
 async def on_message(message):
@@ -216,7 +326,9 @@ async def on_message(message):
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
         "If the user asks what you remember, or how to clear it, tell them they can type "
-        "!recall to see saved facts or !forget to clear them."
+        "!recall to see saved facts or !forget to clear them. "
+        "When a request needs more than one piece of information, plan to call multiple tools in "
+        "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
         + facts_block
     )
 
@@ -255,16 +367,31 @@ async def on_message(message):
                         name = call["function"]["name"]
                         args = call["function"].get("arguments", {})
 
-                        # Narrate intent so the chain feels visible, not silent
-                        await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
-
-                        if name in TOOL_REGISTRY:
+                        if name not in TOOL_REGISTRY:
+                            output = f"Error: Unknown tool {name}"
+                        elif name in CONFIRMATION_REQUIRED_TOOLS:
+                            approved = await confirm_with_reaction(
+                                message,
+                                f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`. "
+                                f"React ✅ to confirm or ❌ to cancel (60s)."
+                            )
+                            if approved:
+                                await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
+                                try:
+                                    output = TOOL_REGISTRY[name](**args)
+                                except Exception as tool_err:
+                                    output = f"Error running tool: {tool_err}"
+                            else:
+                                output = "Action cancelled by the user."
+                        else:
+                            # Narrate intent so the chain feels visible, not silent
+                            await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
                             try:
                                 output = TOOL_REGISTRY[name](**args)
                             except Exception as tool_err:
                                 output = f"Error running tool: {tool_err}"
-                        else:
-                            output = f"Error: Unknown tool {name}"
+
+                        log_tool_call(name, args, output, source="llm")
                         
                         # 3. Create the tool execution result message
                         tool_message = {
