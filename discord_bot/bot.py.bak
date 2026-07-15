@@ -17,23 +17,17 @@ import tools
 
 # --- CONFIGURATION ---
 load_dotenv(find_dotenv())
-MODEL_NAME = "gpt-oss:20b-cloud"
+MODEL_NAME = "gemma4:cloud"
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_CHANNEL_ID = int(os.getenv("ALLOWED_CHANNEL_ID", 0))
+DISCORD_USER_ID = os.getenv("DISCORD_USER_ID")  # Load default user ID from .env
 
 # --- DYNAMIC REGISTRY ---
 OLLAMA_SCHEMAS = []
 TOOL_REGISTRY = {}
 
 # --- ASYNC HTTP SESSION ---
-# One shared aiohttp session reused for every Ollama call, instead of the
-# blocking `requests` library. `requests.post()` blocks the entire asyncio
-# event loop for however long it takes to respond (10-90s for an LLM call) —
-# during that window the bot can't process other messages, the scheduler
-# can't tick, and confirm_with_reaction can't see incoming reactions.
-# aiohttp's calls are awaited, so the event loop stays free for everything
-# else while a request is in flight.
 _session: "aiohttp.ClientSession | None" = None
 
 async def get_session() -> aiohttp.ClientSession:
@@ -43,8 +37,6 @@ async def get_session() -> aiohttp.ClientSession:
     return _session
 
 async def query_ollama(payload: dict, timeout: int = 90) -> dict:
-    """Non-blocking POST to the Ollama chat API. Raises on failure — callers
-    keep their existing try/except around this, same as with requests."""
     session = await get_session()
     async with session.post(
         OLLAMA_API, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)
@@ -52,19 +44,9 @@ async def query_ollama(payload: dict, timeout: int = 90) -> dict:
         return await resp.json()
 
 # --- CONFIRMATION-GATED TOOLS ---
-# Tool names listed here will NOT run immediately when the model calls them.
-# Instead, the bot posts what it's about to do and waits for the requesting
-# user to react with ✅ or ❌ before executing. Use this for anything
-# consequential/destructive (sends a message, deletes a file, restarts a
-# service, spends money, etc). Empty by default — add tool names as you
-# build actions that shouldn't fire on the model's judgment alone, e.g.:
-#   CONFIRMATION_REQUIRED_TOOLS = {"send_email", "delete_file", "restart_service"}
 CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now"}
 
 # --- CONVERSATION MEMORY ---
-# In-memory only (resets on restart). Keeps the last N turns per channel so
-# replies feel continuous instead of stateless. Swap for SQLite later if you
-# want it to survive `systemctl restart`.
 HISTORY_TURNS = 10  # user+assistant pairs kept per channel
 CHANNEL_HISTORY = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
 
@@ -91,6 +73,9 @@ def register_tools():
                     "required": []
                 }
                 for name, param in params.items():
+                    # --- CHANGE: Hide user_id from LLM schema, we will auto-inject it backend ---
+                    if name == "user_id":
+                        continue
                     parameters["properties"][name] = {"type": map_python_type_to_json(param.annotation)}
                     if param.default == inspect.Parameter.empty:
                         parameters["required"].append(name)
@@ -111,8 +96,6 @@ def register_tools():
 register_tools()
 
 # --- PERSISTENT USER MEMORY ---
-# Durable, cross-restart facts about each user, keyed by Discord user ID.
-# Separate from CHANNEL_HISTORY, which is short-term/in-session only.
 MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
 MAX_FACTS_PER_USER = 40  # keep the store from growing unbounded
 
@@ -154,9 +137,6 @@ def clear_user_facts(user_id: str):
         save_all_memory(data)
 
 async def extract_and_store_facts(user_id: str, user_query: str):
-    """Fire-and-forget: ask the model whether this message contains any
-    durable personal fact worth remembering, and save it if so. Runs after
-    the user already has their reply, so it never adds visible latency."""
     extraction_prompt = (
         "Below is a single message a user sent to a Discord bot. Decide if it "
         "contains any NEW durable fact about the user worth remembering long-term "
@@ -186,18 +166,15 @@ async def extract_and_store_facts(user_id: str, user_query: str):
 DISCORD_LIMIT = 2000
 
 # --- TOOL CALL AUDIT LOG ---
-# Append-only record of every tool invocation (LLM-triggered or scheduled),
-# so you can debug "why did it call that" or build a "what did you check
-# recently" feature later. JSONL so it's cheap to append and easy to tail.
 TOOL_LOG_FILE = Path(__file__).resolve().parent / "tool_call_log.jsonl"
 
 def log_tool_call(name: str, args: dict, result, source: str = "llm"):
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": source,       # "llm" (model-triggered) or "scheduler" (proactive)
+        "source": source,
         "tool": name,
         "args": args,
-        "result": str(result)[:500],  # truncate so one noisy tool can't bloat the log
+        "result": str(result)[:500],
     }
     try:
         with open(TOOL_LOG_FILE, "a", encoding="utf-8") as f:
@@ -206,10 +183,6 @@ def log_tool_call(name: str, args: dict, result, source: str = "llm"):
         print(f"[AUDIT] Failed to write tool log: {e}")
 
 # --- PROACTIVE SCHEDULER ---
-# Background jobs that can post to the channel unprompted, instead of only
-# ever responding to a message. Each job is (name, interval_seconds, func).
-# func takes no args and returns either a string (posted to the channel) or
-# None (stays silent this tick). Register more jobs with register_job().
 SCHEDULED_JOBS = []
 
 def register_job(name: str, interval_seconds: int, func):
@@ -220,16 +193,58 @@ def register_job(name: str, interval_seconds: int, func):
         "last_run": 0.0,
     })
 
-def example_heartbeat_check():
-    """Example scheduled job — currently a no-op placeholder. Replace the body
-    with a real check (server health, a monitored feed, a due reminder, disk
-    space, etc.) and return a string when there's something worth posting.
-    Returning None keeps the bot silent for that tick."""
-    return None
+# --- BACKGROUND JOB: CHECK REMINDERS ---
+def check_reminders() -> str | None:
+    """Background check: Loads reminders and returns a ping message for due items."""
+    reminders_file = Path(__file__).resolve().parent / "reminders.json"
+    if not reminders_file.exists():
+        return None
+        
+    try:
+        with open(reminders_file, "r", encoding="utf-8") as f:
+            reminders = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+        
+    now = datetime.now(timezone.utc)
+    due_reminders = []
+    updated_reminders = []
+    
+    for r in reminders:
+        if r.get("active", False):
+            try:
+                # Clean up timezone suffix 'Z' to offset format
+                clean_iso = r["trigger_time"].replace("Z", "+00:00")
+                trigger_dt = datetime.fromisoformat(clean_iso)
+                if trigger_dt <= now:
+                    due_reminders.append(r)
+                    r["active"] = False
+            except Exception as e:
+                print(f"[SCHEDULER] Error parsing reminder time: {e}")
+        updated_reminders.append(r)
+        
+    if not due_reminders:
+        return None
+        
+    # Write back the updated (now deactivated) reminders
+    try:
+        with open(reminders_file, "w", encoding="utf-8") as f:
+            json.dump(updated_reminders, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"[SCHEDULER] Failed to save updated reminders: {e}")
+        
+    # Format pings
+    messages = []
+    for r in due_reminders:
+        # Fall back to env-configured DISCORD_USER_ID if the reminder lacks one
+        uid = r.get("user_id") or DISCORD_USER_ID
+        ping = f"<@{uid}>" if uid else "Someone"
+        messages.append(f"🔔 {ping}! Here is your reminder: **{r['message']}**")
+        
+    return "\n".join(messages)
 
-# Registered but harmless by default (always returns None) until you fill it in.
-# interval_seconds=3600 -> checked hourly once you add real logic.
-register_job("example_heartbeat", 3600, example_heartbeat_check)
+# Register background jobs
+register_job("Reminder Alert", 60, check_reminders)
 
 @tasks.loop(seconds=60)
 async def scheduler_tick():
@@ -248,20 +263,15 @@ async def scheduler_tick():
             if asyncio.iscoroutinefunction(job["func"]):
                 result = await job["func"]()
             else:
-                # Sync job — offload so a slow check (subprocess, file I/O,
-                # network) doesn't block the event loop like the tool calls did.
                 result = await asyncio.to_thread(job["func"])
         except Exception as e:
             print(f"[SCHEDULER] Job '{job['name']}' failed: {e}")
             continue
         if result:
-            await send_chunked(channel, f"🕒 **{job['name']}**: {result}")
+            await send_chunked(channel, result)
             log_tool_call(job["name"], {}, result, source="scheduler")
 
 async def send_chunked(channel, text: str):
-    """Sends text to a Discord channel, splitting into <=2000 char messages.
-    Prefers to break on newlines/spaces near the limit so words aren't sliced
-    mid-word; falls back to a hard cut if no good boundary is found."""
     text = text or ""
     if len(text) <= DISCORD_LIMIT:
         await channel.send(text)
@@ -281,9 +291,6 @@ async def send_chunked(channel, text: str):
         remaining = remaining[cut:].lstrip("\n ")
 
 async def confirm_with_reaction(message, prompt_text: str, timeout: int = 60) -> bool:
-    """Posts prompt_text with ✅/❌ reactions and waits for the requesting user
-    (not just anyone in the channel) to react. Returns True if confirmed,
-    False if declined or if nobody responds within timeout seconds."""
     confirm_msg = await message.channel.send(prompt_text)
     await confirm_msg.add_reaction("✅")
     await confirm_msg.add_reaction("❌")
@@ -323,7 +330,7 @@ async def on_message(message):
     user_query = message.content
     user_id = str(message.author.id)
 
-    # --- Memory commands (handled directly, no LLM call) ---
+    # --- Memory commands ---
     trigger = user_query.strip().lower()
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
         known_facts = get_user_facts(user_id)
@@ -344,12 +351,11 @@ async def on_message(message):
         if known_facts else ""
     )
 
-    # Define personality and instructions
     system_prompt = (
         "Your name is Amoai. Your nickname is Ai. Your name is based on 'Almond Eye' the legendary racehorse and the Uma Musume. "
         "Excelling at both academics and athletics, you also have the makings of a star; you are the ultimate model student, flawless in all aspects. You were only able to achieve this, however, thanks to your defining trait of absolutely hating to lose, a trait which must be prefaced with no fewer than nine 'really's."
         "You are competitive to a point of perfectionism, and the one flaw in your shining qualities is that you often push yourself beyond your body's limits."
-        "You answer quick, concise and direct responses but still have your personality come through"
+        #"You answer quick and concise responses but still show a bit of your personality through."
         "You are a helpful tech-support companion. You manage the server 'hiryu'. Always respond in a friendly tone. "
         "You have access to tools. Always evaluate if a user's request can be answered by using a tool "
         "before responding with text. If no tool is needed, respond as yourself. "
@@ -368,13 +374,11 @@ async def on_message(message):
         {"role": "user", "content": user_query}
     ]
 
-    # Agent loop boundaries to prevent accidental runaways
     max_loops = 5
     loop_count = 0
     running = True
     
     try:
-        # Trigger a typing status so users know the bot is thinking/working
         async with message.channel.typing():
             while running and loop_count < max_loops:
                 payload = {
@@ -389,44 +393,43 @@ async def on_message(message):
                 
                 # Check for tool execution request
                 if "tool_calls" in message_data and message_data["tool_calls"]:
-                    # 1. Append the assistant's request to use the tool to the history
                     messages.append(message_data)
                     
-                    # 2. Iterate and execute all requested tools in this turn
                     for call in message_data["tool_calls"]:
                         name = call["function"]["name"]
                         args = call["function"].get("arguments", {})
 
                         if name not in TOOL_REGISTRY:
                             output = f"Error: Unknown tool {name}"
-                        elif name in CONFIRMATION_REQUIRED_TOOLS:
-                            approved = await confirm_with_reaction(
-                                message,
-                                f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`. "
-                                f"React ✅ to confirm or ❌ to cancel (60s)."
-                            )
-                            if approved:
+                        else:
+                            # --- CHANGE: Auto-inject User ID backend if the tool function expects it ---
+                            sig = inspect.signature(TOOL_REGISTRY[name])
+                            if "user_id" in sig.parameters:
+                                args["user_id"] = str(message.author.id)
+
+                            if name in CONFIRMATION_REQUIRED_TOOLS:
+                                approved = await confirm_with_reaction(
+                                    message,
+                                    f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`. "
+                                    f"React ✅ to confirm or ❌ to cancel (60s)."
+                                )
+                                if approved:
+                                    await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
+                                    try:
+                                        output = await asyncio.to_thread(TOOL_REGISTRY[name], **args)
+                                    except Exception as tool_err:
+                                        output = f"Error running tool: {tool_err}"
+                                else:
+                                    output = "Action cancelled by the user."
+                            else:
                                 await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
                                 try:
-                                    # Tools do blocking I/O (subprocess, file reads,
-                                    # network calls) — run off the event loop so a
-                                    # slow tool doesn't freeze the whole bot.
                                     output = await asyncio.to_thread(TOOL_REGISTRY[name], **args)
                                 except Exception as tool_err:
                                     output = f"Error running tool: {tool_err}"
-                            else:
-                                output = "Action cancelled by the user."
-                        else:
-                            # Narrate intent so the chain feels visible, not silent
-                            await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
-                            try:
-                                output = await asyncio.to_thread(TOOL_REGISTRY[name], **args)
-                            except Exception as tool_err:
-                                output = f"Error running tool: {tool_err}"
 
                         log_tool_call(name, args, output, source="llm")
                         
-                        # 3. Create the tool execution result message
                         tool_message = {
                             "role": "tool",
                             "content": str(output),
@@ -435,14 +438,11 @@ async def on_message(message):
                         if "id" in call:
                             tool_message["tool_call_id"] = call["id"]
                             
-                        # 4. Append tool results to conversation history
                         messages.append(tool_message)
                     
                     loop_count += 1
-                    # Loop continues, sending updated history back to LLM
                     
                 else:
-                    # No tool calls requested (or LLM is finished evaluating tool data)
                     response_text = message_data.get("content", "I processed that, but had nothing to say.")
                     await send_chunked(message.channel, response_text)
                     CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
@@ -451,7 +451,6 @@ async def on_message(message):
                     running = False
 
             if loop_count >= max_loops:
-                # Ask the model to summarize whatever it found instead of bailing with nothing
                 messages.append({
                     "role": "user",
                     "content": "You've hit your tool-call limit. Summarize what you found so far for the user."
@@ -472,8 +471,6 @@ async def on_message(message):
     except Exception as e:
         await send_chunked(message.channel, f"⚠️ Error: {e}")
 
-    # Required so any @bot.command()-style commands you add later still fire —
-    # on_message overrides swallow command dispatch otherwise.
     await bot.process_commands(message)
 
 bot.run(TOKEN)

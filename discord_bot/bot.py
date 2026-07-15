@@ -118,17 +118,22 @@ def save_all_memory(data: dict):
 def get_user_facts(user_id: str) -> list:
     return load_all_memory().get(str(user_id), [])
 
-def add_user_facts(user_id: str, new_facts: list):
+def add_user_facts(user_id: str, new_facts: list) -> list:
+    """Adds new facts for a user, returning only the ones that were
+    actually new (not already known)."""
     if not new_facts:
-        return
+        return []
     data = load_all_memory()
     facts = data.setdefault(str(user_id), [])
+    added = []
     for fact in new_facts:
         fact = fact.strip()
         if fact and fact not in facts:
             facts.append(fact)
+            added.append(fact)
     data[str(user_id)] = facts[-MAX_FACTS_PER_USER:]
     save_all_memory(data)
+    return added
 
 def clear_user_facts(user_id: str):
     data = load_all_memory()
@@ -136,7 +141,33 @@ def clear_user_facts(user_id: str):
         del data[str(user_id)]
         save_all_memory(data)
 
-async def extract_and_store_facts(user_id: str, user_query: str):
+def remove_user_fact(user_id: str, identifier: str):
+    """Removes one fact, matched either by its 1-based position in the
+    user's list (as shown by !recall) or by exact text. Returns the removed
+    fact string, or None if nothing matched."""
+    data = load_all_memory()
+    facts = data.get(str(user_id), [])
+    if not facts:
+        return None
+
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        if 0 <= idx < len(facts):
+            removed = facts.pop(idx)
+            data[str(user_id)] = facts
+            save_all_memory(data)
+            return removed
+        return None
+
+    for i, fact in enumerate(facts):
+        if fact.lower() == identifier.strip().lower():
+            removed = facts.pop(i)
+            data[str(user_id)] = facts
+            save_all_memory(data)
+            return removed
+    return None
+
+async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
     extraction_prompt = (
         "Below is a single message a user sent to a Discord bot. Decide if it "
         "contains any NEW durable fact about the user worth remembering long-term "
@@ -159,7 +190,10 @@ async def extract_and_store_facts(user_id: str, user_query: str):
             raw = raw[4:].strip()
         facts = json.loads(raw)
         if isinstance(facts, list):
-            add_user_facts(user_id, [str(f) for f in facts])
+            added = add_user_facts(user_id, [str(f) for f in facts])
+            if added and channel is not None:
+                subtext = "\n".join(f"-# 🧠 remembered: {f}" for f in added)
+                await send_chunked(channel, subtext)
     except Exception as e:
         print(f"[MEMORY] Extraction skipped (non-fatal): {e}")
 
@@ -204,6 +238,10 @@ def check_reminders() -> str | None:
         with open(reminders_file, "r", encoding="utf-8") as f:
             reminders = json.load(f)
     except (json.JSONDecodeError, OSError):
+        return None
+
+    if not isinstance(reminders, list):
+        print(f"[SCHEDULER] reminders.json contained {type(reminders).__name__}, not a list — skipping this tick.")
         return None
         
     now = datetime.now(timezone.utc)
@@ -335,7 +373,10 @@ async def on_message(message):
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
         known_facts = get_user_facts(user_id)
         if known_facts:
-            text = "Here's what I remember about you:\n" + "\n".join(f"- {f}" for f in known_facts)
+            text = "Here's what I remember about you:\n" + "\n".join(
+                f"{i}. {f}" for i, f in enumerate(known_facts, start=1)
+            )
+            text += "\n\nUse `!forget <number>` to remove one, or `!forget` to clear everything."
         else:
             text = "I don't have anything saved about you yet."
         await send_chunked(message.channel, text)
@@ -343,6 +384,18 @@ async def on_message(message):
     if trigger in ("!forget", "!forgetme", "!clearmemory"):
         clear_user_facts(user_id)
         await send_chunked(message.channel, "Done — I've cleared everything I had saved about you.")
+        return
+    if trigger.startswith("!forget "):
+        identifier = user_query.strip()[len("!forget "):].strip()
+        removed = remove_user_fact(user_id, identifier)
+        if removed:
+            await send_chunked(message.channel, f"🗑️ Forgot: {removed}")
+        else:
+            await send_chunked(
+                message.channel,
+                "I couldn't find a matching fact to remove. Try `!recall` for the numbered list, "
+                "then `!forget <number>`."
+            )
         return
 
     known_facts = get_user_facts(user_id)
@@ -355,16 +408,18 @@ async def on_message(message):
         "Your name is Amoai. Your nickname is Ai. Your name is based on 'Almond Eye' the legendary racehorse and the Uma Musume. "
         "Excelling at both academics and athletics, you also have the makings of a star; you are the ultimate model student, flawless in all aspects. You were only able to achieve this, however, thanks to your defining trait of absolutely hating to lose, a trait which must be prefaced with no fewer than nine 'really's."
         "You are competitive to a point of perfectionism, and the one flaw in your shining qualities is that you often push yourself beyond your body's limits."
-        #"You answer quick and concise responses but still show a bit of your personality through."
+        "You answer quick and concise responses but still show a bit of your personality through."
         "You are a helpful tech-support companion. You manage the server 'hiryu'. Always respond in a friendly tone. "
         "You have access to tools. Always evaluate if a user's request can be answered by using a tool "
         "before responding with text. If no tool is needed, respond as yourself. "
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
         "If the user asks what you remember, or how to clear it, tell them they can type "
-        "!recall to see saved facts or !forget to clear them. "
+        "!recall to see a numbered list of saved facts, !forget <number> to remove just one, "
+        "or !forget on its own to clear everything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
+        f"\n\nCurrent date and time: {datetime.now().astimezone().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
         + facts_block
     )
 
@@ -447,7 +502,7 @@ async def on_message(message):
                     await send_chunked(message.channel, response_text)
                     CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
                     CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": response_text})
-                    asyncio.create_task(extract_and_store_facts(user_id, user_query))
+                    asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
                     running = False
 
             if loop_count >= max_loops:
@@ -466,7 +521,7 @@ async def on_message(message):
                 await send_chunked(message.channel, summary_text)
                 CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
                 CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": summary_text})
-                asyncio.create_task(extract_and_store_facts(user_id, user_query))
+                asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
 
     except Exception as e:
         await send_chunked(message.channel, f"⚠️ Error: {e}")

@@ -11,9 +11,15 @@ def load_reminders() -> list:
         return []
     try:
         with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return []
+    # Guard against a corrupted file that parses but isn't actually a list
+    # (e.g. a stray quoted string or a single object instead of an array).
+    if not isinstance(data, list):
+        print(f"[REMINDER TOOL] reminders.json contained {type(data).__name__}, not a list — resetting.")
+        return []
+    return data
 
 def save_reminders(reminders: list):
     """Saves active reminders back to the JSON file."""
@@ -43,6 +49,10 @@ def set_reminder(user_id: str, message: str, minutes_from_now: float = None, tar
             target_dt = datetime.fromisoformat(clean_iso)
         except ValueError:
             return "❌ Error: Invalid format for target_time_iso. Must be valid ISO-8601."
+        if target_dt.tzinfo is None:
+            # No offset was given (naive datetime) — assume it means local time
+            # rather than letting it crash when compared against aware 'now'.
+            target_dt = target_dt.astimezone()
     elif minutes_from_now is not None:
         if minutes_from_now <= 0:
             return "❌ Error: Time duration must be a positive number of minutes."

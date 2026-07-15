@@ -1,7 +1,7 @@
 import subprocess
 import os
 
-def run(location: str) -> str:
+def check_weather(location: str) -> str:
     """
     Fetches the current weather, temperature, and conditions for a specific 
     location. Use this tool whenever the user asks about the weather, 
