@@ -11,15 +11,15 @@ NYAADLE_LOG = Path("~/.config/nyaadle/nyaadle.log").expanduser()
 DOWNLOAD_LINE = re.compile(r"^(\S+ \S+ \S+) \[INFO\] Downloaded (.+)$")
 
 
-def nyaadle_status() -> str:
+def nyaadle_watchlist() -> str:
     """
-    Lists nyaadle's configured RSS feeds. Use this tool when the user asks
-    what feeds nyaadle is watching, wants to check its feed config, or asks
+    Lists nyaadle's configured watchlists. Use this tool when the user asks
+    what watchlists nyaadle is watching, wants to check its watchlist config, or asks
     "what is nyaadle tracking". Read-only — does not trigger any downloads.
     """
     try:
         result = subprocess.run(
-            [NYAADLE_BIN, "feeds"],
+            [NYAADLE_BIN, "wle","-p"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -27,17 +27,17 @@ def nyaadle_status() -> str:
         output = result.stdout.strip() or result.stderr.strip()
         return output or "No feeds configured, or nyaadle returned no output."
     except subprocess.TimeoutExpired:
-        return "❌ nyaadle feeds check timed out."
+        return "❌ nyaadle wle timed out."
     except Exception as e:
         return f"❌ Failed to query nyaadle: {e}"
 
 
-def nyaadle_recent_downloads(count: int = 10) -> str:
+def nyaadle_status(count: int = 10) -> str:
     """
     Shows the most recently downloaded items from nyaadle's log file, newest
     first. Use this tool when the user asks what nyaadle has downloaded
     recently, wants to see the latest items grabbed, or asks "what did
-    nyaadle get". Read-only — just reads the log file.
+    nyaadle get" or "what's nyaadle's status". Read-only — just reads the log file.
     """
     if not NYAADLE_LOG.exists():
         return f"❌ Log file not found at {NYAADLE_LOG}"
