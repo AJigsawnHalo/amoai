@@ -46,7 +46,15 @@ async def query_ollama(payload: dict, timeout: int = 90) -> dict:
         return await resp.json()
 
 # --- CONFIRMATION-GATED TOOLS ---
-CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now"}
+CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file"}
+OVERWRITE_GATED_TOOLS = {"write_file", "copy_file", "move_file"}
+
+def needs_confirmation(name: str, args: dict) -> bool:
+    if name in CONFIRMATION_REQUIRED_TOOLS:
+        return True
+    if name in OVERWRITE_GATED_TOOLS and args.get("overwrite") is True:
+        return True
+    return False
 
 # --- CONVERSATION MEMORY ---
 HISTORY_TURNS = 10  # user+assistant pairs kept per channel
@@ -64,7 +72,7 @@ def register_tools():
         module = importlib.import_module(f"tools.{module_name}")
         for attr_name in dir(module):
             func = getattr(module, attr_name)
-            if callable(func) and not attr_name.startswith('_') and getattr(func, '__module__', None) == f"tools.{module_name}":
+            if callable(func) and not inspect.isclass(func) and not attr_name.startswith('_') and getattr(func, '__module__', None) == f"tools.{module_name}":
                 sig = inspect.signature(func)
                 params = sig.parameters
                 
@@ -477,8 +485,7 @@ async def on_message(message):
         "You are competitive to a point of perfectionism, and the one flaw in your shining qualities is that you often push yourself beyond your body's limits."
         "You answer quick and concise responses but still show a bit of your personality through."
         "You are a helpful tech-support companion. You manage the server 'hiryu'. Always respond in a friendly tone. "
-        "You have access to tools. Always evaluate if a user's request can be answered by using a tool "
-        "before responding with text. If no tool is needed, respond as yourself. "
+        "You have access to tools. Always evaluate if a user's request can be answered by using a tool before responding with text. If no tool is needed, respond as yourself. "
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
         "If the user asks what you remember, or how to clear it, tell them they can type "
@@ -529,7 +536,7 @@ async def on_message(message):
                             if "user_id" in sig.parameters:
                                 args["user_id"] = str(message.author.id)
 
-                            if name in CONFIRMATION_REQUIRED_TOOLS:
+                            if needs_confirmation(name, args):
                                 approved = await confirm_with_reaction(
                                     message,
                                     f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`. "

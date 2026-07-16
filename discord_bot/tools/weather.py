@@ -1,46 +1,66 @@
-import subprocess
-import os
+import urllib.request
+import urllib.parse
+import json
 
 def check_weather(location: str) -> str:
     """
-    Fetches the current weather, temperature, and conditions for a specific 
-    location. Use this tool whenever the user asks about the weather, 
-    forecasts, or current atmospheric conditions.
+    Fetches weather data for a location and returns a structured, machine-readable
+    JSON string. All units are guaranteed to be in metric.
     """
-    runner_path = os.path.expanduser("~/.amoai/weather-tool/task_runner.py")
+    # %l: Location, %C: Weather, %t: Temp, %f: Feels Like, %w: Wind, %p: Precip (mm), %o: Chance
+    fmt = "Location: %l, Weather: %C, Temp: %t, FeelsLike: %f, Wind: %w, Precip: %p, Chance: %o"
+    
+    safe_location = urllib.parse.quote(location)
+    safe_fmt = urllib.parse.quote(fmt)
+    # The '?m' parameter forces metric units (Celsius, km/h, mm)
+    url = f"https://wttr.in/{safe_location}?m&format={safe_fmt}"
     
     try:
-        result = subprocess.run(
-            ['python3', runner_path, location],
-            capture_output=True,
-            text=True,
-            check=True
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'curl/7.64.1'}
         )
-        raw_output = result.stdout.strip()
-        
-        # If the output isn't formatted how we expect, return it raw
+        with urllib.request.urlopen(req, timeout=5) as response:
+            raw_output = response.read().decode('utf-8').strip()
+            
+        # Fallback if wttr.in returns an unparseable error page
         if ": " not in raw_output:
-            return f"Raw Weather Output: {raw_output}"
+            return json.dumps({
+                "status": "error",
+                "message": f"Raw output not in expected format: {raw_output}"
+            })
 
-        # Parse logic
+        # Parse key-value string into a dictionary
         parts = raw_output.split(", ")
         data = {}
         for p in parts:
             if ": " in p:
                 key, val = p.split(": ", 1)
-                data[key] = val
+                data[key.strip()] = val.strip()
         
-        # Build the "Pretty" Output
-        return (
-            f"**🌤️ Weather Report for {data.get('Location', location)}**\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"**Conditions:** {data.get('Weather', 'N/A')}\n"
-            f"**🌡️ Temperature:** {data.get('Temp', 'N/A')}\n"
-            f"**💨 Wind Speed:** {data.get('Wind', 'N/A')}\n"
-            f"**💧 Precipitation:** {data.get('Precip', 'N/A')}\n"
-            f"**☂️ Chance of Rain:** {data.get('Chance', 'N/A')}\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
+        # Enforce and format 'mm/h' unit representation
+        precip = data.get('Precip', '0mm')
+        if 'mm' in precip and '/h' not in precip:
+            precip = precip.replace('mm', ' mm/h')
+        elif 'mm' not in precip:
+            precip = f"{precip} mm/h"
+
+        # Build clean, machine-readable output
+        structured_output = {
+            "status": "success",
+            "location": data.get("Location", location),
+            "conditions": data.get("Weather", "N/A"),
+            "temperature": data.get("Temp", "N/A"),
+            "feels_like_temperature": data.get("FeelsLike", "N/A"),
+            "wind_speed": data.get("Wind", "N/A"),
+            "precipitation_intensity": precip,
+            "chance_of_rain": data.get("Chance", "N/A")
+        }
+        
+        return json.dumps(structured_output, ensure_ascii=False)
         
     except Exception as e:
-        return f"⚠️ Bridge Error: {str(e)}"
+        return json.dumps({
+            "status": "error",
+            "message": str(e)
+        })
