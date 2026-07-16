@@ -7,13 +7,15 @@ import importlib
 import pkgutil
 import inspect
 import aiohttp
+from aiohttp import web
 import discord
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict, deque
 from discord.ext import commands, tasks
 from dotenv import load_dotenv, find_dotenv
-import tools 
+import tools
+from tools.reminder_tool import _fire_arrival_reminders
 
 # --- CONFIGURATION ---
 load_dotenv(find_dotenv())
@@ -249,6 +251,11 @@ def check_reminders() -> str | None:
     updated_reminders = []
     
     for r in reminders:
+        # Arrival-based reminders have no trigger_time to compare — they're
+        # fired by the webhook handler instead, not this timer-based job.
+        if r.get("trigger_type") == "arrival":
+            updated_reminders.append(r)
+            continue
         if r.get("active", False):
             try:
                 # Clean up timezone suffix 'Z' to offset format
@@ -309,6 +316,65 @@ async def scheduler_tick():
             await send_chunked(channel, result)
             log_tool_call(job["name"], {}, result, source="scheduler")
 
+# --- HOME ASSISTANT ARRIVAL WEBHOOK ---
+# A small HTTP listener so Home Assistant can push a "you just got home"
+# event the instant it happens, instead of the bot polling HA's REST API on
+# a timer. Protected by a shared secret so nothing else on your LAN can
+# trigger it. Set ARRIVAL_WEBHOOK_SECRET in .env or this stays disabled.
+ARRIVAL_WEBHOOK_PORT = int(os.getenv("ARRIVAL_WEBHOOK_PORT", 8787))
+ARRIVAL_WEBHOOK_SECRET = os.getenv("ARRIVAL_WEBHOOK_SECRET")
+_webhook_runner = None  # kept as a module-level ref so the site isn't GC'd
+
+async def on_arrived_home(user_id: str):
+    """Fires when Home Assistant reports arrival for user_id. Fires any
+    pending 'on arrival' reminders for that user; falls back to a generic
+    welcome if there weren't any."""
+    if not ALLOWED_CHANNEL_ID:
+        return
+    channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+    if channel is None:
+        return
+
+    fired = await asyncio.to_thread(_fire_arrival_reminders, user_id)
+    text = fired if fired else f"🏠 Welcome home, <@{user_id}>!"
+    await send_chunked(channel, text)
+    log_tool_call("on_arrived_home", {"user_id": user_id}, text, source="webhook")
+
+async def handle_arrived_home(request: web.Request) -> web.Response:
+    if not ARRIVAL_WEBHOOK_SECRET or request.headers.get("X-Webhook-Secret") != ARRIVAL_WEBHOOK_SECRET:
+        return web.Response(status=401, text="unauthorized")
+
+    # Home Assistant can optionally POST {"user_id": "<discord id>"} so this
+    # supports more than one person's arrival later. Falls back to the
+    # single-user default in .env if the body doesn't specify one.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_id = str(body.get("user_id") or DISCORD_USER_ID or "")
+    if not user_id:
+        return web.Response(status=400, text="no user_id in request or DISCORD_USER_ID in .env")
+
+    await on_arrived_home(user_id)
+    return web.Response(status=200, text="ok")
+
+async def start_webhook_server():
+    global _webhook_runner
+    if _webhook_runner is not None:
+        return  # already running — on_ready can fire again on reconnect
+    if not ARRIVAL_WEBHOOK_SECRET:
+        print("[WEBHOOK] ARRIVAL_WEBHOOK_SECRET not set in .env — arrival webhook disabled.")
+        return
+    app = web.Application()
+    app.router.add_post("/webhook/arrived-home", handle_arrived_home)
+    _webhook_runner = web.AppRunner(app)
+    await _webhook_runner.setup()
+    # Bind to the LAN interface, not 0.0.0.0-to-the-internet. Adjust if hiryu
+    # has a specific LAN IP you'd rather bind explicitly.
+    site = web.TCPSite(_webhook_runner, "0.0.0.0", ARRIVAL_WEBHOOK_PORT)
+    await site.start()
+    print(f"[WEBHOOK] Listening for arrival events on :{ARRIVAL_WEBHOOK_PORT}")
+
 async def send_chunked(channel, text: str):
     text = text or ""
     if len(text) <= DISCORD_LIMIT:
@@ -357,6 +423,7 @@ async def on_ready():
     print(f"[SYSTEM] Logged in as {bot.user}")
     if not scheduler_tick.is_running():
         scheduler_tick.start()
+    await start_webhook_server()
 
 @bot.event
 async def on_message(message):
@@ -529,3 +596,4 @@ async def on_message(message):
     await bot.process_commands(message)
 
 bot.run(TOKEN)
+
