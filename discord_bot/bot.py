@@ -60,6 +60,11 @@ def needs_confirmation(name: str, args: dict) -> bool:
 HISTORY_TURNS = 10  # user+assistant pairs kept per channel
 CHANNEL_HISTORY = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
 
+# --- ACTIVE TASK TRACKING (for !stop) ---
+# discord.py runs each on_message dispatch as its own asyncio Task, so we
+# just need to remember which Task belongs to which user to cancel it later.
+ACTIVE_TASKS: dict[str, asyncio.Task] = {}
+
 def map_python_type_to_json(py_type):
     """Maps Python types to JSON schema types for the LLM."""
     mapping = {str: "string", int: "number", float: "number", bool: "boolean"}
@@ -445,6 +450,17 @@ async def on_message(message):
 
     # --- Memory commands ---
     trigger = user_query.strip().lower()
+
+    # --- Stop command: cancel whatever this user currently has running ---
+    if trigger in ("!stop", "!cancel", "!halt"):
+        task = ACTIVE_TASKS.get(user_id)
+        if task and not task.done():
+            task.cancel()
+            await send_chunked(message.channel, "🛑 Stopping...")
+        else:
+            await send_chunked(message.channel, "Nothing's running right now.")
+        return
+
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
         known_facts = get_user_facts(user_id)
         if known_facts:
@@ -506,7 +522,10 @@ async def on_message(message):
     max_loops = 5
     loop_count = 0
     running = True
-    
+
+    # Register this message's task so !stop can find and cancel it.
+    ACTIVE_TASKS[user_id] = asyncio.current_task()
+
     try:
         async with message.channel.typing():
             while running and loop_count < max_loops:
@@ -597,10 +616,19 @@ async def on_message(message):
                 CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": summary_text})
                 asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
 
+    except asyncio.CancelledError:
+        await send_chunked(message.channel, "🛑 Stopped.")
+        raise
     except Exception as e:
         await send_chunked(message.channel, f"⚠️ Error: {e}")
+    finally:
+        # Only clear the slot if it's still pointing at this task (avoids
+        # a race where a newer message already overwrote it).
+        if ACTIVE_TASKS.get(user_id) is asyncio.current_task():
+            del ACTIVE_TASKS[user_id]
 
     await bot.process_commands(message)
 
 bot.run(TOKEN)
+
 
