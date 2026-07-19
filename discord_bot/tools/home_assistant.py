@@ -170,6 +170,34 @@ def ha_set_climate_hvac_mode(entity_id: str, hvac_mode: str) -> str:
         return f"❌ Failed to set mode on {entity_id}: {e}"
 
 
+# --- SELECT ENTITIES (dropdowns) ---
+
+def ha_select_option(entity_id: str, option: str) -> str:
+    """
+    Sets a Home Assistant 'select' entity to one of its predefined dropdown
+    options (e.g. entity_id 'select.vacuum_cleaning_mode' with option 'quiet',
+    or a mode/preset selector like 'select.washer_cycle'). Use this when the
+    user asks to change a mode, preset, or dropdown-style setting rather than a
+    simple on/off or a numeric value. The option must match one of the choices
+    exactly as reported by ha_get_state's 'options' attribute for that entity —
+    call ha_get_state first if you aren't sure of the valid options.
+    """
+    try:
+        _request(
+            "POST",
+            "/api/services/select/select_option",
+            {"entity_id": entity_id, "option": option},
+        )
+        return f"✅ Set {entity_id} to '{option}'."
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            return (f"❌ '{option}' isn't a valid option for {entity_id}. "
+                     f"Check ha_get_state's 'options' attribute for the valid choices.")
+        return f"❌ Home Assistant error: {e}"
+    except Exception as e:
+        return f"❌ Failed to set {entity_id}: {e}"
+
+
 # --- AUTOMATIONS / SCRIPTS ---
 
 def ha_run_script(entity_id: str) -> str:

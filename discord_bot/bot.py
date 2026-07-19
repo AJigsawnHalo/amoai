@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 from discord.ext import commands, tasks
 from dotenv import load_dotenv, find_dotenv
 import tools
-from tools.reminder_tool import _fire_arrival_reminders
+from tools.reminder_tool import _get_due_arrival_reminders, _get_due_time_reminders
 
 # --- CONFIGURATION ---
 load_dotenv(find_dotenv())
@@ -24,6 +24,7 @@ OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_CHANNEL_ID = int(os.getenv("ALLOWED_CHANNEL_ID", 0))
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID")  # Load default user ID from .env
+LOCAL_FALLBACK_MODEL = os.getenv("LOCAL_FALLBACK_MODEL", "aliafshar/gemma3-it-qat-tools:1b")
 
 # --- DYNAMIC REGISTRY ---
 OLLAMA_SCHEMAS = []
@@ -38,15 +39,97 @@ async def get_session() -> aiohttp.ClientSession:
         _session = aiohttp.ClientSession()
     return _session
 
-async def query_ollama(payload: dict, timeout: int = 90) -> dict:
+async def query_ollama(payload: dict, timeout: int = 90, retries: int = 2) -> dict:
     session = await get_session()
-    async with session.post(
-        OLLAMA_API, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)
-    ) as resp:
-        return await resp.json()
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            async with session.post(
+                OLLAMA_API, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                status = resp.status
+                if status != 200:
+                    body = (await resp.text())[:300]
+                    _dump_failed_payload(payload, status, body)
+                    if 500 <= status < 600 and attempt < retries:
+                        last_err = RuntimeError(f"Ollama backend returned {status}. Body: {body}")
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"Ollama backend returned {status}. Body: {body}")
+
+                try:
+                    data = await resp.json()
+                except aiohttp.ContentTypeError:
+                    body = (await resp.text())[:300]
+                    _dump_failed_payload(payload, status, body)
+                    raise RuntimeError(f"Ollama backend returned non-JSON response: {body}")
+
+                err_text = _extract_masked_error(data)
+                if err_text is not None:
+                    _dump_failed_payload(payload, status, err_text[:300])
+                    if attempt < retries:
+                        last_err = RuntimeError(f"Ollama returned a masked error: {err_text[:300]}")
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"Ollama returned a masked error: {err_text[:300]}")
+
+                return data
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            if attempt < retries:
+                last_err = e
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+
+def _extract_masked_error(data: dict) -> "str | None":
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("error"), str) and data["error"].strip():
+        return data["error"]
+    content = data.get("message", {}).get("content", "") if isinstance(data.get("message"), dict) else ""
+    if isinstance(content, str) and (
+        "<html" in content.lower()
+        or content.lstrip()[:3].isdigit() and "internal server error" in content.lower()
+    ):
+        return content
+    return None
+
+
+def _dump_failed_payload(payload: dict, status: int, body: str):
+    try:
+        dump_path = Path(__file__).resolve().parent / f"failed_payload_{int(time.time())}.json"
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        print(f"[DEBUG] Dumped failing payload to {dump_path} "
+              f"(status={status}, tools={len(payload.get('tools', []))}, "
+              f"payload_bytes={len(json.dumps(payload))}, body={body[:200]!r})")
+    except Exception as dump_err:
+        print(f"[DEBUG] Failed to dump payload: {dump_err}")
+
+
+async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
+    try:
+        return await query_ollama(payload, timeout=timeout)
+    except Exception as cloud_err:
+        print(f"[FALLBACK] Cloud model '{payload.get('model')}' failed ({cloud_err}); "
+              f"falling back to local model '{LOCAL_FALLBACK_MODEL}'.")
+        if channel is not None:
+            try:
+                await send_chunked(
+                    channel,
+                    f"⚠️ Cloud model (`{payload.get('model')}`) is unavailable right now — "
+                    f"falling back to local model `{LOCAL_FALLBACK_MODEL}`..."
+                )
+            except Exception:
+                pass
+        fallback_payload = dict(payload)
+        fallback_payload["model"] = LOCAL_FALLBACK_MODEL
+        return await query_ollama(fallback_payload, timeout=timeout, retries=1)
 
 # --- CONFIRMATION-GATED TOOLS ---
-CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file"}
+CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file", "delete_calendar_event"}
 OVERWRITE_GATED_TOOLS = {"write_file", "copy_file", "move_file"}
 
 def needs_confirmation(name: str, args: dict) -> bool:
@@ -57,21 +140,17 @@ def needs_confirmation(name: str, args: dict) -> bool:
     return False
 
 # --- CONVERSATION MEMORY ---
-HISTORY_TURNS = 10  # user+assistant pairs kept per channel
+HISTORY_TURNS = 10 
 CHANNEL_HISTORY = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
 
-# --- ACTIVE TASK TRACKING (for !stop) ---
-# discord.py runs each on_message dispatch as its own asyncio Task, so we
-# just need to remember which Task belongs to which user to cancel it later.
+# --- ACTIVE TASK TRACKING ---
 ACTIVE_TASKS: dict[str, asyncio.Task] = {}
 
 def map_python_type_to_json(py_type):
-    """Maps Python types to JSON schema types for the LLM."""
     mapping = {str: "string", int: "number", float: "number", bool: "boolean"}
     return mapping.get(py_type, "string")
 
 def register_tools():
-    """Scans 'tools/' folder, maps functions, and builds schema on boot."""
     print("[SYSTEM] Discovering tools...")
     for _, module_name, _ in pkgutil.iter_modules(tools.__path__):
         module = importlib.import_module(f"tools.{module_name}")
@@ -81,14 +160,12 @@ def register_tools():
                 sig = inspect.signature(func)
                 params = sig.parameters
                 
-                # Build JSON Schema
                 parameters = {
                     "type": "object",
                     "properties": {},
                     "required": []
                 }
                 for name, param in params.items():
-                    # --- CHANGE: Hide user_id from LLM schema, we will auto-inject it backend ---
                     if name == "user_id":
                         continue
                     parameters["properties"][name] = {"type": map_python_type_to_json(param.annotation)}
@@ -107,12 +184,11 @@ def register_tools():
                 TOOL_REGISTRY[func.__name__] = func
                 print(f"[SYSTEM] Loaded tool: {func.__name__}")
 
-# Initialize and register tools
 register_tools()
 
 # --- PERSISTENT USER MEMORY ---
 MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
-MAX_FACTS_PER_USER = 40  # keep the store from growing unbounded
+MAX_FACTS_PER_USER = 40 
 
 def load_all_memory() -> dict:
     if not MEMORY_FILE.exists():
@@ -134,8 +210,6 @@ def get_user_facts(user_id: str) -> list:
     return load_all_memory().get(str(user_id), [])
 
 def add_user_facts(user_id: str, new_facts: list) -> list:
-    """Adds new facts for a user, returning only the ones that were
-    actually new (not already known)."""
     if not new_facts:
         return []
     data = load_all_memory()
@@ -157,9 +231,6 @@ def clear_user_facts(user_id: str):
         save_all_memory(data)
 
 def remove_user_fact(user_id: str, identifier: str):
-    """Removes one fact, matched either by its 1-based position in the
-    user's list (as shown by !recall) or by exact text. Returns the removed
-    fact string, or None if nothing matched."""
     data = load_all_memory()
     facts = data.get(str(user_id), [])
     if not facts:
@@ -198,7 +269,7 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
         "stream": False
     }
     try:
-        response = await query_ollama(payload, timeout=60)
+        response = await query_llm(payload, timeout=60)
         raw = response.get("message", {}).get("content", "[]").strip()
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
@@ -242,67 +313,60 @@ def register_job(name: str, interval_seconds: int, func):
         "last_run": 0.0,
     })
 
-# --- BACKGROUND JOB: CHECK REMINDERS ---
-def check_reminders() -> str | None:
-    """Background check: Loads reminders and returns a ping message for due items."""
-    reminders_file = Path(__file__).resolve().parent / "reminders.json"
-    if not reminders_file.exists():
-        return None
-        
-    try:
-        with open(reminders_file, "r", encoding="utf-8") as f:
-            reminders = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
-
-    if not isinstance(reminders, list):
-        print(f"[SCHEDULER] reminders.json contained {type(reminders).__name__}, not a list — skipping this tick.")
-        return None
-        
-    now = datetime.now(timezone.utc)
-    due_reminders = []
-    updated_reminders = []
-    
-    for r in reminders:
-        # Arrival-based reminders have no trigger_time to compare — they're
-        # fired by the webhook handler instead, not this timer-based job.
-        if r.get("trigger_type") == "arrival":
-            updated_reminders.append(r)
-            continue
-        if r.get("active", False):
-            try:
-                # Clean up timezone suffix 'Z' to offset format
-                clean_iso = r["trigger_time"].replace("Z", "+00:00")
-                trigger_dt = datetime.fromisoformat(clean_iso)
-                if trigger_dt <= now:
-                    due_reminders.append(r)
-                    r["active"] = False
-            except Exception as e:
-                print(f"[SCHEDULER] Error parsing reminder time: {e}")
-        updated_reminders.append(r)
-        
-    if not due_reminders:
-        return None
-        
-    # Write back the updated (now deactivated) reminders
-    try:
-        with open(reminders_file, "w", encoding="utf-8") as f:
-            json.dump(updated_reminders, f, indent=2, ensure_ascii=False)
-    except OSError as e:
-        print(f"[SCHEDULER] Failed to save updated reminders: {e}")
-        
-    # Format pings
-    messages = []
-    for r in due_reminders:
-        # Fall back to env-configured DISCORD_USER_ID if the reminder lacks one
+async def _resolve_due_reminders(due: list) -> str:
+    """Given a list of due reminder dicts (from reminder_tool's
+    _get_due_time_reminders / _get_due_arrival_reminders — already
+    deactivated and saved), runs any attached action_tool via the live
+    TOOL_REGISTRY and builds the text to post in the channel. Plain
+    reminders (no action_tool) just become a ping."""
+    lines = []
+    for r in due:
         uid = r.get("user_id") or DISCORD_USER_ID
         ping = f"<@{uid}>" if uid else "Someone"
-        messages.append(f"🔔 {ping}! Here is your reminder: **{r['message']}**")
-        
-    return "\n".join(messages)
+        message = r.get("message", "")
+        action_tool = r.get("action_tool")
 
-# Register background jobs
-register_job("Reminder Alert", 60, check_reminders)
+        if not action_tool:
+            lines.append(f"🔔 {ping}! Here is your reminder: **{message}**")
+            continue
+
+        if action_tool not in TOOL_REGISTRY:
+            text = f"🔔 {ping} ⚠️ **{message}** was due, but the tool `{action_tool}` no longer exists."
+            log_tool_call(action_tool, r.get("action_args", {}), "unknown tool", source="scheduler")
+            lines.append(text)
+            continue
+
+        args = dict(r.get("action_args") or {})
+        func = TOOL_REGISTRY[action_tool]
+        if "user_id" in inspect.signature(func).parameters:
+            args["user_id"] = str(r.get("user_id") or "")
+
+        if needs_confirmation(action_tool, args):
+            text = (
+                f"🔔 {ping} ⏰ **{message}** is due and would run `{action_tool}`, "
+                "but that tool needs confirmation and can't run unattended — please run it yourself."
+            )
+            log_tool_call(action_tool, args, "skipped: needs confirmation", source="scheduler")
+            lines.append(text)
+            continue
+
+        try:
+            output = await asyncio.to_thread(func, **args)
+        except Exception as e:
+            output = f"Error running tool: {e}"
+        log_tool_call(action_tool, args, output, source="scheduler")
+        lines.append(f"🔔 {ping} ⏰ **{message}** — {output}")
+
+    return "\n".join(lines)
+
+
+async def check_scheduled_reminders() -> str | None:
+    due = await asyncio.to_thread(_get_due_time_reminders)
+    if not due:
+        return None
+    return await _resolve_due_reminders(due)
+
+register_job("Reminder Alert", 60, check_scheduled_reminders)
 
 @tasks.loop(seconds=60)
 async def scheduler_tick():
@@ -330,36 +394,36 @@ async def scheduler_tick():
             log_tool_call(job["name"], {}, result, source="scheduler")
 
 # --- HOME ASSISTANT ARRIVAL WEBHOOK ---
-# A small HTTP listener so Home Assistant can push a "you just got home"
-# event the instant it happens, instead of the bot polling HA's REST API on
-# a timer. Protected by a shared secret so nothing else on your LAN can
-# trigger it. Set ARRIVAL_WEBHOOK_SECRET in .env or this stays disabled.
 ARRIVAL_WEBHOOK_PORT = int(os.getenv("ARRIVAL_WEBHOOK_PORT", 8787))
 ARRIVAL_WEBHOOK_SECRET = os.getenv("ARRIVAL_WEBHOOK_SECRET")
-_webhook_runner = None  # kept as a module-level ref so the site isn't GC'd
+_webhook_runner = None 
 
-async def on_arrived_home(user_id: str):
-    """Fires when Home Assistant reports arrival for user_id. Fires any
-    pending 'on arrival' reminders for that user; falls back to a generic
-    welcome if there weren't any."""
+async def on_arrived_home(user_id: str, zone: str = "home"):
     if not ALLOWED_CHANNEL_ID:
         return
     channel = bot.get_channel(ALLOWED_CHANNEL_ID)
     if channel is None:
         return
 
-    fired = await asyncio.to_thread(_fire_arrival_reminders, user_id)
-    text = fired if fired else f"🏠 Welcome home, <@{user_id}>!"
+    due = await asyncio.to_thread(_get_due_arrival_reminders, user_id, zone)
+    if due:
+        text = await _resolve_due_reminders(due)
+    elif zone == "home":
+        # 'home' keeps its old unconditional greeting even with no reminder set.
+        text = f"🏠 Welcome home, <@{user_id}>!"
+    else:
+        # Other zones stay silent unless a reminder was actually set for them.
+        log_tool_call("on_arrived_home", {"user_id": user_id, "zone": zone},
+                      "no reminder set for this zone, skipped", source="webhook")
+        return
+
     await send_chunked(channel, text)
-    log_tool_call("on_arrived_home", {"user_id": user_id}, text, source="webhook")
+    log_tool_call("on_arrived_home", {"user_id": user_id, "zone": zone}, text, source="webhook")
 
 async def handle_arrived_home(request: web.Request) -> web.Response:
     if not ARRIVAL_WEBHOOK_SECRET or request.headers.get("X-Webhook-Secret") != ARRIVAL_WEBHOOK_SECRET:
         return web.Response(status=401, text="unauthorized")
 
-    # Home Assistant can optionally POST {"user_id": "<discord id>"} so this
-    # supports more than one person's arrival later. Falls back to the
-    # single-user default in .env if the body doesn't specify one.
     try:
         body = await request.json()
     except Exception:
@@ -367,14 +431,15 @@ async def handle_arrived_home(request: web.Request) -> web.Response:
     user_id = str(body.get("user_id") or DISCORD_USER_ID or "")
     if not user_id:
         return web.Response(status=400, text="no user_id in request or DISCORD_USER_ID in .env")
+    zone = str(body.get("zone") or "home").strip().lower()
 
-    await on_arrived_home(user_id)
+    await on_arrived_home(user_id, zone)
     return web.Response(status=200, text="ok")
 
 async def start_webhook_server():
     global _webhook_runner
     if _webhook_runner is not None:
-        return  # already running — on_ready can fire again on reconnect
+        return  
     if not ARRIVAL_WEBHOOK_SECRET:
         print("[WEBHOOK] ARRIVAL_WEBHOOK_SECRET not set in .env — arrival webhook disabled.")
         return
@@ -382,8 +447,6 @@ async def start_webhook_server():
     app.router.add_post("/webhook/arrived-home", handle_arrived_home)
     _webhook_runner = web.AppRunner(app)
     await _webhook_runner.setup()
-    # Bind to the LAN interface, not 0.0.0.0-to-the-internet. Adjust if hiryu
-    # has a specific LAN IP you'd rather bind explicitly.
     site = web.TCPSite(_webhook_runner, "0.0.0.0", ARRIVAL_WEBHOOK_PORT)
     await site.start()
     print(f"[WEBHOOK] Listening for arrival events on :{ARRIVAL_WEBHOOK_PORT}")
@@ -408,7 +471,11 @@ async def send_chunked(channel, text: str):
         remaining = remaining[cut:].lstrip("\n ")
 
 async def confirm_with_reaction(message, prompt_text: str, timeout: int = 60) -> bool:
-    confirm_msg = await message.channel.send(prompt_text)
+    # Use send_chunked to avoid the 2000 character limit[span_1](start_span)[span_1](end_span)
+    await send_chunked(message.channel, prompt_text)
+    
+    # Send a small confirmation prompt to add the reactions to
+    confirm_msg = await message.channel.send("React ✅ to confirm or ❌ to cancel (60s).")
     await confirm_msg.add_reaction("✅")
     await confirm_msg.add_reaction("❌")
 
@@ -431,12 +498,23 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="", intents=intents)
 
+_startup_notified = False
+
 @bot.event
 async def on_ready():
+    global _startup_notified
     print(f"[SYSTEM] Logged in as {bot.user}")
     if not scheduler_tick.is_running():
         scheduler_tick.start()
     await start_webhook_server()
+
+    # Only announce once per process start — on_ready can fire again on reconnects
+    if not _startup_notified:
+        _startup_notified = True
+        if ALLOWED_CHANNEL_ID:
+            channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+            if channel:
+                await channel.send(f"🔄 Restarted and online as **{bot.user}**.")
 
 @bot.event
 async def on_message(message):
@@ -448,10 +526,8 @@ async def on_message(message):
     user_query = message.content
     user_id = str(message.author.id)
 
-    # --- Memory commands ---
     trigger = user_query.strip().lower()
 
-    # --- Stop command: cancel whatever this user currently has running ---
     if trigger in ("!stop", "!cancel", "!halt"):
         task = ACTIVE_TASKS.get(user_id)
         if task and not task.done():
@@ -501,7 +577,7 @@ async def on_message(message):
         "You are competitive to a point of perfectionism, and the one flaw in your shining qualities is that you often push yourself beyond your body's limits."
         "You answer quick and concise responses but still show a bit of your personality through."
         "You are a helpful tech-support companion. You manage the server 'hiryu'. Always respond in a friendly tone. "
-        "You have access to tools. Always evaluate if a user's request can be answered by using a tool before responding with text. If no tool is needed, respond as yourself. "
+        "You have access to tools. Always evaluate if a user's request can be answered by using a tool before responding with text. If no tool is needed, respond as yourself. If the user asks a follow up question after you used a tool, always evaluate if you need to use a tool to correctly answer."
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
         "If the user asks what you remember, or how to clear it, tell them they can type "
@@ -509,6 +585,7 @@ async def on_message(message):
         "or !forget on its own to clear everything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
+        "You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. If you need to represent a matrix or a table, use a plain text grid or a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
         f"\n\nCurrent date and time: {datetime.now().astimezone().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
         + facts_block
     )
@@ -523,7 +600,6 @@ async def on_message(message):
     loop_count = 0
     running = True
 
-    # Register this message's task so !stop can find and cancel it.
     ACTIVE_TASKS[user_id] = asyncio.current_task()
 
     try:
@@ -536,10 +612,9 @@ async def on_message(message):
                     "stream": False
                 }
                 
-                response = await query_ollama(payload, timeout=90)
+                response = await query_llm(payload, timeout=90, channel=message.channel)
                 message_data = response.get("message", {})
                 
-                # Check for tool execution request
                 if "tool_calls" in message_data and message_data["tool_calls"]:
                     messages.append(message_data)
                     
@@ -550,7 +625,6 @@ async def on_message(message):
                         if name not in TOOL_REGISTRY:
                             output = f"Error: Unknown tool {name}"
                         else:
-                            # --- CHANGE: Auto-inject User ID backend if the tool function expects it ---
                             sig = inspect.signature(TOOL_REGISTRY[name])
                             if "user_id" in sig.parameters:
                                 args["user_id"] = str(message.author.id)
@@ -558,8 +632,7 @@ async def on_message(message):
                             if needs_confirmation(name, args):
                                 approved = await confirm_with_reaction(
                                     message,
-                                    f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`. "
-                                    f"React ✅ to confirm or ❌ to cancel (60s)."
+                                    f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`."
                                 )
                                 if approved:
                                     await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
@@ -605,7 +678,7 @@ async def on_message(message):
                 })
                 try:
                     summary_payload = {"model": MODEL_NAME, "messages": messages, "stream": False}
-                    summary_response = await query_ollama(summary_payload, timeout=90)
+                    summary_response = await query_llm(summary_payload, timeout=90, channel=message.channel)
                     summary_text = summary_response.get("message", {}).get(
                         "content", "⚠️ Hit my execution limit without a clear answer."
                     )
@@ -620,15 +693,12 @@ async def on_message(message):
         await send_chunked(message.channel, "🛑 Stopped.")
         raise
     except Exception as e:
-        await send_chunked(message.channel, f"⚠️ Error: {e}")
+        err_text = str(e)
+        if "<html" in err_text.lower() or len(err_text) > 400:
+            err_text = err_text[:200] + " …(truncated — check server logs)"
+        await send_chunked(message.channel, f"⚠️ Error: {err_text}")
     finally:
-        # Only clear the slot if it's still pointing at this task (avoids
-        # a race where a newer message already overwrote it).
         if ACTIVE_TASKS.get(user_id) is asyncio.current_task():
             del ACTIVE_TASKS[user_id]
 
-    await bot.process_commands(message)
-
 bot.run(TOKEN)
-
-

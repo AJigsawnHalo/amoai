@@ -2,3 +2,6 @@
 .env
 discord_bot/*.json
 discord_bot/*.jsonl
+discord_bot/data/
+log-monitor/*.json
+log-monitor/*.lock

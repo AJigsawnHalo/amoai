@@ -30,38 +30,67 @@ def _save_reminders(reminders: list):
     except OSError as e:
         print(f"[REMINDER TOOL] Failed to save reminders: {e}")
 
+
 def set_reminder(
     user_id: str,
     message: str,
     minutes_from_now: float = None,
     target_time_iso: str = None,
     on_arrival: bool = False,
+    zone: str = "home",
+    action_tool: str = None,
+    action_args_json: str = None,
 ) -> str:
     """
-    Saves a reminder to mention (ping) a user on Discord. Can be time-based
-    (fires at a specific future time) or arrival-based (fires the next time
-    Home Assistant reports the user has arrived home).
+    Saves a reminder for the user. Can just ping them with a message, or —
+    if action_tool is given — actually RUN another one of your tools when it
+    comes due and report the result. Use this for requests like "turn on the
+    AC after 30 mins", "restart the server at 11pm", or "when I get home,
+    turn off the porch light": pick the right tool from your own tool list
+    for the action, and schedule it here instead of calling it immediately.
 
-    :param user_id: The Discord user ID of the person to be reminded.
-    :param message: What the user wants to be reminded of (e.g., 'Do laundry', 'Check oven')
-    :param minutes_from_now: Optional. The number of minutes from now to trigger the reminder.
+    Firing can be time-based (a delay or an absolute date/time) or
+    arrival-based (fires next time Home Assistant reports the user entered a
+    given zone).
+
+    :param user_id: The Discord user ID of the person to be reminded / on whose behalf the action runs.
+    :param message: A short human-readable label for what this reminder is about (e.g. 'Do laundry', 'Turn on the AC'). Always required, even for action reminders — it's shown to the user.
+    :param minutes_from_now: Optional. The number of minutes from now to trigger.
     :param target_time_iso: Optional. An absolute future date/time in ISO format (e.g., '2026-07-20T15:00:00Z').
-    :param on_arrival: Optional. If true, ignores the time params entirely and instead
-        fires the next time the user is detected arriving home — e.g. "remind me to take
-        out the trash when I get home".
+    :param on_arrival: Optional. If true, ignores the time params entirely and instead fires the next time the user is detected entering the given zone.
+    :param zone: Optional, only used with on_arrival. The Home Assistant zone name to watch for (e.g. 'home', 'gym', 'office'). Defaults to 'home'. Must match the zone name reported by the arrival webhook.
+    :param action_tool: Optional. The exact name of another tool you have access to (e.g. a Home Assistant control tool). If given, that tool is actually called when this reminder fires, instead of just sending a plain ping. Omit for a plain reminder.
+    :param action_args_json: Optional, only used with action_tool. A JSON object (as a string) of the arguments to pass to that tool, using its exact parameter names — e.g. '{"entity": "ac", "state": "on"}'. Do NOT include user_id here; it's added automatically if the tool needs it. Use '{}' if the tool takes no arguments.
     """
+    action_args = None
+    if action_tool:
+        raw_args = action_args_json if action_args_json is not None else "{}"
+        try:
+            action_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            return "❌ Error: action_args_json must be a valid JSON object string, e.g. '{\"entity\": \"ac\"}'."
+        if not isinstance(action_args, dict):
+            return "❌ Error: action_args_json must decode to a JSON object (key/value pairs), not a list or scalar."
+
     if on_arrival:
+        zone = (zone or "home").strip().lower()
         new_reminder = {
             "user_id": str(user_id),
             "trigger_type": "arrival",
             "trigger_time": None,
+            "trigger_zone": zone,
             "message": message,
+            "action_tool": action_tool,
+            "action_args": action_args or {},
             "active": True,
         }
         reminders = _load_reminders()
         reminders.append(new_reminder)
         _save_reminders(reminders)
-        return f"✅ Got it — I'll remind you to **{message}** the next time you get home."
+        where = "you get home" if zone == "home" else f"you arrive at '{zone}'"
+        if action_tool:
+            return f"✅ Got it — I'll run **{action_tool}** ({message}) the next time {where}."
+        return f"✅ Got it — I'll remind you to **{message}** the next time {where}."
 
     now = datetime.now(timezone.utc)
     target_dt = None
@@ -81,7 +110,6 @@ def set_reminder(
     elif minutes_from_now is not None:
         if minutes_from_now <= 0:
             return "❌ Error: Time duration must be a positive number of minutes."
-        # FIXED: Removed the buggy 'import timedelta' line
         from datetime import timedelta
         target_dt = now + timedelta(minutes=minutes_from_now)
     else:
@@ -95,6 +123,8 @@ def set_reminder(
         "trigger_type": "time",
         "trigger_time": target_dt.isoformat(),
         "message": message,
+        "action_tool": action_tool,
+        "action_args": action_args or {},
         "active": True
     }
 
@@ -106,14 +136,16 @@ def set_reminder(
     local_target = target_dt.astimezone()
     formatted_time = local_target.strftime("%A, %B %d, %Y at %I:%M %p")
 
+    if action_tool:
+        return f"✅ Scheduled! I will run **{action_tool}** ({message}) on {formatted_time}."
     return f"✅ Reminder saved! I will ping you on {formatted_time} to: **{message}**"
 
 
 def list_reminders(user_id: str) -> str:
     """
     Lists all of this user's currently active (not yet fired or cancelled)
-    reminders, both time-based and arrival-based. Each is numbered so the
-    number can be passed to cancel_reminder.
+    reminders and scheduled actions, both time-based and arrival-based.
+    Each is numbered so the number can be passed to cancel_reminder.
     """
     reminders = _load_reminders()
     active = [r for r in reminders if r.get("active") and str(r.get("user_id")) == str(user_id)]
@@ -123,8 +155,14 @@ def list_reminders(user_id: str) -> str:
 
     lines = []
     for i, r in enumerate(active, start=1):
+        action_tool = r.get("action_tool")
+        action_note = f" _(runs `{action_tool}`)_" if action_tool else ""
+        icon = "⚙️" if action_tool else "⏰"
+
         if r.get("trigger_type") == "arrival":
-            lines.append(f"{i}. 🏠 On arrival: **{r.get('message', '')}**")
+            zone = r.get("trigger_zone", "home")
+            zone_label = "On arrival" if zone == "home" else f"On arrival at '{zone}'"
+            lines.append(f"{i}. 🏠 {zone_label}: **{r.get('message', '')}**{action_note}")
         else:
             formatted = r.get("trigger_time", "unknown time")
             try:
@@ -134,7 +172,7 @@ def list_reminders(user_id: str) -> str:
                 formatted = local_dt.strftime("%A, %B %d, %Y at %I:%M %p")
             except Exception:
                 pass
-            lines.append(f"{i}. ⏰ {formatted}: **{r.get('message', '')}**")
+            lines.append(f"{i}. {icon} {formatted}: **{r.get('message', '')}**{action_note}")
 
     return (
         "Here are your active reminders:\n"
@@ -145,9 +183,9 @@ def list_reminders(user_id: str) -> str:
 
 def cancel_reminder(user_id: str, identifier: str) -> str:
     """
-    Cancels one of this user's active reminders. Matched either by its
-    1-based position in the list returned by list_reminders, or by a
-    snippet of text from the reminder's message.
+    Cancels one of this user's active reminders or scheduled actions.
+    Matched either by its 1-based position in the list returned by
+    list_reminders, or by a snippet of text from the reminder's message.
 
     :param identifier: The number shown by list_reminders (e.g. '2'), or a piece of the reminder's message text to match against.
     """
@@ -185,10 +223,17 @@ def cancel_reminder(user_id: str, identifier: str) -> str:
     return f"🗑️ Cancelled reminder: **{cancelled.get('message', '')}**"
 
 
-def _fire_arrival_reminders(user_id: str) -> Optional[str]:
-    """Finds active 'on arrival' reminders for this user, deactivates them,
-    and returns a formatted ping string — or None if there were none due.
-    Called by the arrival webhook handler in bot.py, not by the LLM."""
+def _get_due_arrival_reminders(user_id: str, zone: str = "home") -> list:
+    """Finds active 'on arrival' reminders for this user matching the given
+    zone, deactivates them, and returns the list of due reminder dicts (each
+    carrying message and, if applicable, action_tool/action_args) — or [] if
+    none were due. Reminders saved before zones existed have no
+    'trigger_zone' key and are treated as 'home'.
+    Called by the arrival webhook handler in bot.py, not by the LLM.
+    bot.py is responsible for actually running any action_tool and for
+    formatting/sending the resulting message, since it's the only place
+    that has the tool registry."""
+    zone = (zone or "home").strip().lower()
     reminders = _load_reminders()
     due = []
     updated = []
@@ -197,14 +242,43 @@ def _fire_arrival_reminders(user_id: str) -> Optional[str]:
             r.get("active")
             and r.get("trigger_type") == "arrival"
             and str(r.get("user_id")) == str(user_id)
+            and r.get("trigger_zone", "home") == zone
         ):
             due.append(r)
             r["active"] = False
         updated.append(r)
 
     if not due:
-        return None
+        return []
 
     _save_reminders(updated)
-    lines = [f"🔔 <@{user_id}>! Here is your reminder: **{r['message']}**" for r in due]
-    return "\n".join(lines)
+    return due
+
+
+def _get_due_time_reminders() -> list:
+    """Finds all active time-based reminders whose trigger time has passed,
+    deactivates them, and returns the list of due reminder dicts (each
+    carrying message and, if applicable, action_tool/action_args).
+    Called by the scheduler tick in bot.py, not by the LLM. bot.py is
+    responsible for actually running any action_tool and for
+    formatting/sending the resulting message."""
+    reminders = _load_reminders()
+    now = datetime.now(timezone.utc)
+    due = []
+    updated = []
+
+    for r in reminders:
+        if r.get("trigger_type") == "time" and r.get("active"):
+            try:
+                clean_iso = r["trigger_time"].replace("Z", "+00:00")
+                trigger_dt = datetime.fromisoformat(clean_iso)
+                if trigger_dt <= now:
+                    due.append(r)
+                    r["active"] = False
+            except Exception as e:
+                print(f"[REMINDER TOOL] Error parsing reminder time: {e}")
+        updated.append(r)
+
+    if due:
+        _save_reminders(updated)
+    return due
