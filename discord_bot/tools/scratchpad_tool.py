@@ -14,10 +14,24 @@ X" — that ALWAYS means their INDEXED files (search_knowledge), never
 anything in here, even if something was jotted down here earlier in the
 same conversation. This module is for jotting something down fresh in the
 conversation itself, e.g. "jot this down", "quick scratchpad entry: call
-the plumber tomorrow", "remember this for later: <thing>" — content that
-doesn't exist as a file anywhere. Deliberately named without the word
-"note" in any function name, to avoid being pulled in by phrases that are
-actually about the indexed knowledge base.
+the plumber tomorrow" — content that doesn't exist as a file anywhere.
+Deliberately named without the word "note" in any function name, to avoid
+being pulled in by phrases that are actually about the indexed knowledge
+base.
+
+--- Boundary with reminder_tool.py ---
+This module never schedules anything and has no concept of time. If the
+request includes a delay, a clock time, a date, or "when I get home/arrive
+at X", that is set_reminder in reminder_tool.py, not jot_down — even if the
+user phrases it as "remember to X at 5pm". A bare "remember this: <thing>"
+with no time attached is the only case where "remember" means jot_down.
+
+--- Boundary with the bot's own background memory ---
+Durable facts about the user themselves (name, job, preferences, ongoing
+routines) are captured automatically by a separate process after every
+message. Don't call jot_down to record a fact about the user — it's for
+freeform content the user explicitly wants jotted down verbatim, not
+personal facts the bot infers about them.
 
 Public tool functions (auto-discovered by bot.py's register_tools()):
     - jot_down(content, tag)
@@ -60,15 +74,15 @@ def _save_entries(entries: list):
 
 def jot_down(user_id: str, content: str, tag: str = None) -> str:
     """
-    Jots down a short freeform entry straight from the conversation — NOT a
-    file, and NOT the indexed knowledge base. Use this for things like "jot
-    this down: the wifi password changed", "quick scratchpad entry: call
-    the plumber tomorrow", "remember this for later: <thing>".
-
-    Do NOT use this tool for "based on my notes" or any phrase containing
-    the word "notes" — that always means the user's previously INDEXED
-    documents, which is search_knowledge in rag_knowledge.py, regardless of
-    whether something was jotted down here earlier in the conversation.
+    Jots down a short freeform entry straight from the conversation, saved
+    with no time trigger and no source file. Use this for: "jot this down:
+    the wifi password changed", "add to scratchpad: call the plumber
+    tomorrow", "quick note: <thing>". Also covers a bare "remember this:
+    <thing>" that has no clock time, delay, or arrival event attached — if
+    a time or arrival IS attached ("remind me at 5pm", "when I get home"),
+    use set_reminder instead, not this tool. And if the user says "notes"
+    ("based on my notes", "search my notes"), that means the indexed
+    knowledge base — use search_knowledge instead, not this tool.
 
     :param content: The text of the entry itself.
     :param tag: Optional short label to group related entries (e.g. 'shopping', 'ideas'). Omit if the user doesn't give one.

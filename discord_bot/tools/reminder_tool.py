@@ -2,6 +2,16 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+# Canonical timezone this bot operates in. All reminder times the user gives
+# without an explicit UTC offset (e.g. "9pm tonight") are interpreted as this
+# zone, and all times shown back to the user are converted to this zone —
+# rather than relying on `.astimezone()` with no args, which silently uses
+# whatever timezone the HOST MACHINE happens to be configured with (often
+# UTC on a server), not the user's actual GMT+8. Change this one constant if
+# the bot ever needs to serve a different timezone.
+BOT_TIMEZONE = ZoneInfo("Asia/Manila")  # GMT+8, no DST
 
 # Path to the persistent reminders storage file (located in the bot's root directory)
 REMINDERS_FILE = Path(__file__).resolve().parent.parent / "reminders.json"
@@ -48,6 +58,9 @@ def set_reminder(
     AC after 30 mins", "restart the server at 11pm", or "when I get home,
     turn off the porch light": pick the right tool from your own tool list
     for the action, and schedule it here instead of calling it immediately.
+    Requires an actual time, delay, or arrival zone — if the user just wants
+    something jotted down with no trigger attached ("jot this down: buy
+    milk"), that's jot_down instead, not this tool.
 
     Firing can be time-based (a delay or an absolute date/time) or
     arrival-based (fires next time Home Assistant reports the user entered a
@@ -55,8 +68,8 @@ def set_reminder(
 
     :param user_id: The Discord user ID of the person to be reminded / on whose behalf the action runs.
     :param message: A short human-readable label for what this reminder is about (e.g. 'Do laundry', 'Turn on the AC'). Always required, even for action reminders — it's shown to the user.
-    :param minutes_from_now: Optional. The number of minutes from now to trigger.
-    :param target_time_iso: Optional. An absolute future date/time in ISO format (e.g., '2026-07-20T15:00:00Z').
+    :param minutes_from_now: Preferred for anything relative ("in 20 minutes", "in 2 hours", "in a couple days"). Convert the request to a plain number of minutes yourself and pass it here — do NOT also compute an absolute target_time_iso for a relative request, and do not use both params at once.
+    :param target_time_iso: Only for an explicit calendar date/time ("at 9pm", "next Tuesday at 3pm", "on August 5th"). Build this from the "Current date and time" given to you in the system prompt — never guess or invent the current date/year. If you omit the UTC offset, it's interpreted as GMT+8 (the bot's home timezone), so for a plain local time like "9pm tonight" just write it without an offset, e.g. '2026-07-21T21:00:00' — do not add 'Z' or a UTC offset unless the user explicitly gave you one.
     :param on_arrival: Optional. If true, ignores the time params entirely and instead fires the next time the user is detected entering the given zone.
     :param zone: Optional, only used with on_arrival. The Home Assistant zone name to watch for (e.g. 'home', 'gym', 'office'). Defaults to 'home'. Must match the zone name reported by the arrival webhook.
     :param action_tool: Optional. The exact name of another tool you have access to (e.g. a Home Assistant control tool). If given, that tool is actually called when this reminder fires, instead of just sending a plain ping. Omit for a plain reminder.
@@ -104,9 +117,10 @@ def set_reminder(
         except ValueError:
             return "❌ Error: Invalid format for target_time_iso. Must be valid ISO-8601."
         if target_dt.tzinfo is None:
-            # No offset was given (naive datetime) — assume it means local time
-            # rather than letting it crash when compared against aware 'now'.
-            target_dt = target_dt.astimezone()
+            # No offset was given (naive datetime) — treat it as BOT_TIMEZONE
+            # (the user's actual local time), not whatever timezone the host
+            # machine happens to be set to.
+            target_dt = target_dt.replace(tzinfo=BOT_TIMEZONE)
     elif minutes_from_now is not None:
         if minutes_from_now <= 0:
             return "❌ Error: Time duration must be a positive number of minutes."
@@ -117,6 +131,17 @@ def set_reminder(
 
     if target_dt < now:
         return "❌ Error: The calculated reminder time is in the past!"
+
+    # Sanity check: a target more than ~2 years out is almost always the
+    # model hallucinating/mis-computing a date (e.g. picking the wrong year)
+    # rather than a genuine request. Bounce it back instead of silently
+    # scheduling something wrong.
+    if (target_dt - now).days > 730:
+        return (
+            f"❌ Error: That works out to {target_dt.date().isoformat()}, over 2 years from now — "
+            "this is probably a miscalculated date rather than what the user meant. "
+            "Double check the year and try again with an explicit date."
+        )
 
     new_reminder = {
         "user_id": str(user_id),
@@ -132,9 +157,9 @@ def set_reminder(
     reminders.append(new_reminder)
     _save_reminders(reminders)
 
-    # Output a friendly formatted confirmation string using local timezone
-    local_target = target_dt.astimezone()
-    formatted_time = local_target.strftime("%A, %B %d, %Y at %I:%M %p")
+    # Output a friendly formatted confirmation string in the bot's home timezone
+    local_target = target_dt.astimezone(BOT_TIMEZONE)
+    formatted_time = local_target.strftime("%A, %B %d, %Y at %I:%M %p %Z")
 
     if action_tool:
         return f"✅ Scheduled! I will run **{action_tool}** ({message}) on {formatted_time}."
@@ -168,8 +193,8 @@ def list_reminders(user_id: str) -> str:
             try:
                 clean_iso = r["trigger_time"].replace("Z", "+00:00")
                 trigger_dt = datetime.fromisoformat(clean_iso)
-                local_dt = trigger_dt.astimezone()
-                formatted = local_dt.strftime("%A, %B %d, %Y at %I:%M %p")
+                local_dt = trigger_dt.astimezone(BOT_TIMEZONE)
+                formatted = local_dt.strftime("%A, %B %d, %Y at %I:%M %p %Z")
             except Exception:
                 pass
             lines.append(f"{i}. {icon} {formatted}: **{r.get('message', '')}**{action_note}")

@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 from discord.ext import commands, tasks
 from dotenv import load_dotenv, find_dotenv
 import tools
-from tools.reminder_tool import _get_due_arrival_reminders, _get_due_time_reminders
+from tools.reminder_tool import _get_due_arrival_reminders, _get_due_time_reminders, BOT_TIMEZONE
 
 # --- CONFIGURATION ---
 load_dotenv(find_dotenv())
@@ -100,8 +100,17 @@ def _extract_masked_error(data: dict) -> "str | None":
 def _dump_failed_payload(payload: dict, status: int, body: str):
     try:
         dump_path = Path(__file__).resolve().parent / f"failed_payload_{int(time.time())}.json"
+        dump_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "error_body": body,
+            "model": payload.get("model"),
+            "message_count": len(payload.get("messages", [])),
+            "tool_count": len(payload.get("tools", [])),
+            "payload": payload,
+        }
         with open(dump_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+            json.dump(dump_data, f, indent=2, ensure_ascii=False)
         print(f"[DEBUG] Dumped failing payload to {dump_path} "
               f"(status={status}, tools={len(payload.get('tools', []))}, "
               f"payload_bytes={len(json.dumps(payload))}, body={body[:200]!r})")
@@ -129,7 +138,7 @@ async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
         return await query_ollama(fallback_payload, timeout=timeout, retries=1)
 
 # --- CONFIRMATION-GATED TOOLS ---
-CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file", "delete_calendar_event"}
+CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file", "delete_calendar_event", "clear_failure_logs"}
 OVERWRITE_GATED_TOOLS = {"write_file", "copy_file", "move_file"}
 
 def needs_confirmation(name: str, args: dict) -> bool:
@@ -580,13 +589,34 @@ async def on_message(message):
         "You have access to tools. Always evaluate if a user's request can be answered by using a tool before responding with text. If no tool is needed, respond as yourself. If the user asks a follow up question after you used a tool, always evaluate if you need to use a tool to correctly answer."
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
+        "\n\nMEMORY & NOTE-TAKING ROUTING — you have four separate places information can go, and "
+        "picking the wrong one is the single most common mistake, so match the literal trigger words "
+        "below instead of guessing:\n"
+        "• A specific future time, delay, or arrival event ('remind me', 'in 30 minutes', 'at 9pm "
+        "tonight', 'when I get home') → set_reminder.\n"
+        "• 'jot this down', 'add to scratchpad', 'quick note', or 'remember this for later: <thing>' "
+        "with NO time attached and NO existing file involved → jot_down.\n"
+        "• The word 'notes' in any form ('my notes', 'search my notes', 'based on my notes') → "
+        "search_knowledge. 'notes' always means the indexed knowledge base, never the scratchpad, "
+        "even if something related was jotted down earlier in this conversation.\n"
+        "• 'index this file/folder', 'add this doc to memory', 'learn this PDF' → "
+        "index_knowledge_base.\n"
+        "• A durable personal fact about the user themselves (their name, job, preferences, ongoing "
+        "projects) is captured automatically in the background after every message — this happens on "
+        "its own, so don't call jot_down or set_reminder just to record a fact about the user.\n"
+        "When a request could plausibly match two of these, go with whichever trigger words above are "
+        "the closest literal match; only ask the user to confirm if it's genuinely ambiguous.\n\n"
+        "For set_reminder specifically: prefer minutes_from_now for anything relative ('in 20 minutes') "
+        "instead of computing an absolute time yourself — date/time arithmetic is easy to get wrong. "
+        "For an explicit date/time, build target_time_iso from the 'Current date and time' below, and "
+        "never guess the year if the user didn't give one.\n\n"
         "If the user asks what you remember, or how to clear it, tell them they can type "
         "!recall to see a numbered list of saved facts, !forget <number> to remove just one, "
         "or !forget on its own to clear everything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
         "You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. If you need to represent a matrix or a table, use a plain text grid or a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
-        f"\n\nCurrent date and time: {datetime.now().astimezone().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
+        f"\n\nCurrent date and time (GMT+8): {datetime.now(BOT_TIMEZONE).strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
         + facts_block
     )
 
