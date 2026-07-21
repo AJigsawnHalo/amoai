@@ -4,6 +4,8 @@ import asyncio
 import json
 import hashlib
 import time
+import base64
+import io
 import importlib
 import pkgutil
 import inspect
@@ -163,6 +165,30 @@ async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
                 pass
         fallback_payload = dict(payload)
         fallback_payload["model"] = LOCAL_FALLBACK_MODEL
+
+        # Vision is cloud-only — the local fallback model can't see images, so
+        # strip any "images" fields rather than sending them into the void
+        # (or crashing a non-vision local model on a field it doesn't expect).
+        stripped_images = False
+        if "messages" in fallback_payload:
+            scrubbed_messages = []
+            for m in fallback_payload["messages"]:
+                if isinstance(m, dict) and m.get("images"):
+                    m = {k: v for k, v in m.items() if k != "images"}
+                    stripped_images = True
+                scrubbed_messages.append(m)
+            fallback_payload["messages"] = scrubbed_messages
+
+        if stripped_images and channel is not None:
+            try:
+                await send_chunked(
+                    channel,
+                    "⚠️ The local fallback model can't see images — continuing "
+                    "without the attached image(s)."
+                )
+            except Exception:
+                pass
+
         result = await query_ollama(fallback_payload, timeout=timeout, retries=1)
         LAST_CHAT_BACKEND = "local"
         return result
@@ -705,6 +731,131 @@ async def confirm_with_reaction(message, prompt_text: str, timeout: int = 60) ->
         await send_chunked(message.channel, "⏳ No response in time — action cancelled.")
         return False
 
+# --- ATTACHMENT HANDLING (IMAGE VISION + FILE READING) ---
+# Vision is restricted to the cloud model (gemma4:cloud) — query_llm's
+# fallback path strips "images" before ever handing a payload to the local
+# model, so this stays true even if the request falls back mid-flight.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+MAX_IMAGE_ATTACHMENTS = 4       # cap per message — keep payload size sane
+MAX_IMAGE_BYTES = 8_000_000     # 8MB per image before we refuse to download it
+
+# Mirrors tools/rag_knowledge.py's SUPPORTED_TEXT_EXTS — kept as its own copy
+# here since this is about reading a Discord attachment inline, not indexing.
+TEXT_FILE_EXTENSIONS = {
+    ".md", ".markdown", ".txt", ".py", ".js", ".ts", ".json", ".yaml",
+    ".yml", ".toml", ".cfg", ".ini", ".sh", ".html", ".css", ".sql",
+    ".csv", ".log", ".xml",
+}
+MAX_FILE_ATTACHMENT_BYTES = 2_000_000  # cap on raw bytes we'll download per file
+MAX_FILE_TEXT_CHARS = 20_000         # cap on extracted text injected per file
+
+
+async def _download_attachment(attachment: "discord.Attachment", max_bytes: int) -> "bytes | None":
+    """Downloads an attachment's bytes, refusing anything over max_bytes.
+    Returns None on refusal or on a failed download so callers can report a
+    clean skip message instead of crashing the whole request."""
+    if attachment.size and attachment.size > max_bytes:
+        return None
+    try:
+        return await attachment.read()
+    except (discord.HTTPException, discord.NotFound):
+        return None
+
+
+def _extract_pdf_text(data: bytes, max_chars: int) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader  # fallback for older installs
+        except ImportError:
+            return "[Could not extract text — 'pypdf' is not installed.]"
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as e:
+        return f"[Could not parse PDF: {e}]"
+
+    parts = []
+    total = 0
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        parts.append(text)
+        total += len(text)
+        if total >= max_chars:
+            break
+
+    joined = "\n".join(parts).strip()
+    if len(joined) > max_chars:
+        joined = joined[:max_chars] + "\n...[truncated]"
+    return joined or "[No extractable text found — this PDF may be scanned/image-based.]"
+
+
+async def process_image_attachments(attachments: "list[discord.Attachment]") -> "tuple[list[str], list[str]]":
+    """Downloads image attachments and base64-encodes them for the Ollama
+    'images' field. Returns (base64_images, notes) — notes are skip/error
+    messages worth surfacing to the user."""
+    notes = []
+    image_atts = [a for a in attachments if Path(a.filename).suffix.lower() in IMAGE_EXTENSIONS]
+
+    if len(image_atts) > MAX_IMAGE_ATTACHMENTS:
+        notes.append(f"⚠️ Only looking at the first {MAX_IMAGE_ATTACHMENTS} images attached.")
+        image_atts = image_atts[:MAX_IMAGE_ATTACHMENTS]
+
+    images_b64 = []
+    for att in image_atts:
+        data = await _download_attachment(att, MAX_IMAGE_BYTES)
+        if data is None:
+            notes.append(
+                f"⚠️ Skipped `{att.filename}` — over {MAX_IMAGE_BYTES // 1_000_000}MB "
+                f"or failed to download."
+            )
+            continue
+        images_b64.append(base64.b64encode(data).decode("ascii"))
+
+    return images_b64, notes
+
+
+async def process_file_attachments(attachments: "list[discord.Attachment]") -> "tuple[str, list[str]]":
+    """Downloads non-image attachments and extracts their text (PDF or plain
+    text), returning a context block ready to append to the user's message,
+    plus any skip/error notes worth surfacing to the user."""
+    notes = []
+    blocks = []
+    file_atts = [a for a in attachments if Path(a.filename).suffix.lower() not in IMAGE_EXTENSIONS]
+
+    for att in file_atts:
+        suffix = Path(att.filename).suffix.lower()
+        data = await _download_attachment(att, MAX_FILE_ATTACHMENT_BYTES)
+        if data is None:
+            notes.append(
+                f"⚠️ Skipped `{att.filename}` — over "
+                f"{MAX_FILE_ATTACHMENT_BYTES // 1000}KB or failed to download."
+            )
+            continue
+
+        if suffix == ".pdf":
+            text = await asyncio.to_thread(_extract_pdf_text, data, MAX_FILE_TEXT_CHARS)
+        elif suffix in TEXT_FILE_EXTENSIONS or suffix == "":
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                notes.append(f"⚠️ Skipped `{att.filename}` — doesn't look like a text file.")
+                continue
+            if len(text) > MAX_FILE_TEXT_CHARS:
+                text = text[:MAX_FILE_TEXT_CHARS] + "\n...[truncated]"
+        else:
+            notes.append(f"⚠️ Skipped `{att.filename}` — unsupported file type (`{suffix}`).")
+            continue
+
+        blocks.append(f"--- Attached file: {att.filename} ---\n{text}\n--- end of {att.filename} ---")
+
+    return "\n\n".join(blocks), notes
+
+
 # Initialize Bot
 intents = discord.Intents.default()
 intents.message_content = True
@@ -738,6 +889,22 @@ async def on_message(message):
 
     user_query = message.content
     user_id = str(message.author.id)
+
+    # --- ATTACHMENTS: images go to vision, everything else gets read as text ---
+    pending_images_b64 = []
+    file_context = ""
+    if message.attachments:
+        pending_images_b64, image_notes = await process_image_attachments(message.attachments)
+        file_context, file_notes = await process_file_attachments(message.attachments)
+
+        if file_context:
+            user_query = f"{user_query}\n\n[Attached file contents below]\n{file_context}" if user_query else file_context
+        elif not user_query and pending_images_b64:
+            user_query = "Take a look at the attached image(s) and describe what you see."
+
+        attachment_notes = image_notes + file_notes
+        if attachment_notes:
+            await send_chunked(message.channel, "\n".join(attachment_notes))
 
     trigger = user_query.strip().lower()
 
@@ -821,13 +988,26 @@ async def on_message(message):
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
         "You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. If you need to represent a matrix or a table, use a plain text grid or a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
         f"\n\nCurrent date and time (GMT+8): {datetime.now(BOT_TIMEZONE).strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
+        + ("\n\nThe user has attached one or more images to this message — you can see "
+           "them directly, so describe or analyze them instead of saying you can't view "
+           "images. (If you were quietly switched to the local fallback model, the "
+           "images were dropped before reaching you — say so if asked about them.)"
+           if pending_images_b64 else "")
+        + ("\n\nThe user attached one or more files to this message — their text content "
+           "has been inlined below under '[Attached file contents below]'. Treat that as "
+           "read, not something you need a tool to fetch."
+           if file_context else "")
         + facts_block
     )
+
+    current_user_message = {"role": "user", "content": user_query}
+    if pending_images_b64:
+        current_user_message["images"] = pending_images_b64
 
     messages = [
         {"role": "system", "content": system_prompt},
         *CHANNEL_HISTORY[message.channel.id],
-        {"role": "user", "content": user_query}
+        current_user_message
     ]
 
     max_loops = 5
