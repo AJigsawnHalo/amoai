@@ -2,6 +2,7 @@ import os
 import sys
 import asyncio
 import json
+import hashlib
 import time
 import importlib
 import pkgutil
@@ -21,10 +22,34 @@ from tools.reminder_tool import _get_due_arrival_reminders, _get_due_time_remind
 load_dotenv(find_dotenv())
 MODEL_NAME = "gemma4:cloud"
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_EMBED_API = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{{model}}:embedContent"
+)
+# Last-resort embedding path — only reached when Gemini's embedding call
+# fails AND chat is already running on the local fallback model (see
+# LAST_CHAT_BACKEND below). Reuses the same local Ollama instance the bot
+# already talks to for chat, and the same model rag_knowledge.py uses.
+LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "nomic-embed-text")
+LOCAL_EMBED_API = os.getenv("LOCAL_EMBED_API", "http://localhost:11434/api/embeddings")
+TOOL_TOP_K = int(os.getenv("TOOL_TOP_K", 12))
+# Tools always sent regardless of relevance — cheap insurance for stuff the
+# model reaches for constantly or that a bad embedding match shouldn't hide.
+CORE_TOOLS = {"jot_down", "set_reminder", "search_knowledge"}
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_CHANNEL_ID = int(os.getenv("ALLOWED_CHANNEL_ID", 0))
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID")  # Load default user ID from .env
 LOCAL_FALLBACK_MODEL = os.getenv("LOCAL_FALLBACK_MODEL", "aliafshar/gemma3-it-qat-tools:1b")
+
+# Tracks which backend actually served the most recent chat response ("cloud"
+# or "local"). Used as a proxy signal in select_relevant_tools(): if Gemini's
+# embedding call fails AND the bot is currently running on the local fallback
+# chat model, it's worth paying the local-embedding cost too, since context
+# is tight there and an unfiltered 50-tool dump would blow the budget. If
+# chat is still on the cloud model, an unfiltered dump is harmless, so there's
+# no reason to touch a local embedding model at all.
+LAST_CHAT_BACKEND = "cloud"
 
 # --- DYNAMIC REGISTRY ---
 OLLAMA_SCHEMAS = []
@@ -119,8 +144,11 @@ def _dump_failed_payload(payload: dict, status: int, body: str):
 
 
 async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
+    global LAST_CHAT_BACKEND
     try:
-        return await query_ollama(payload, timeout=timeout)
+        result = await query_ollama(payload, timeout=timeout)
+        LAST_CHAT_BACKEND = "cloud"
+        return result
     except Exception as cloud_err:
         print(f"[FALLBACK] Cloud model '{payload.get('model')}' failed ({cloud_err}); "
               f"falling back to local model '{LOCAL_FALLBACK_MODEL}'.")
@@ -135,7 +163,9 @@ async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
                 pass
         fallback_payload = dict(payload)
         fallback_payload["model"] = LOCAL_FALLBACK_MODEL
-        return await query_ollama(fallback_payload, timeout=timeout, retries=1)
+        result = await query_ollama(fallback_payload, timeout=timeout, retries=1)
+        LAST_CHAT_BACKEND = "local"
+        return result
 
 # --- CONFIRMATION-GATED TOOLS ---
 CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file", "delete_calendar_event", "clear_failure_logs"}
@@ -194,6 +224,179 @@ def register_tools():
                 print(f"[SYSTEM] Loaded tool: {func.__name__}")
 
 register_tools()
+
+# --- DYNAMIC TOOL SELECTION (embedding-based) ---
+TOOL_EMBEDDINGS: dict[str, list[float]] = {}
+TOOL_EMBED_CACHE_FILE = Path(__file__).resolve().parent / "tool_embedding_cache.json"
+# Separate space/cache for the local nomic fallback — never mixed with the
+# Gemini embeddings above, see select_relevant_tools_local().
+TOOL_EMBEDDINGS_LOCAL: dict[str, list[float]] = {}
+TOOL_EMBED_LOCAL_CACHE_FILE = Path(__file__).resolve().parent / "tool_embedding_cache_local.json"
+
+async def get_embedding(text: str) -> "list[float] | None":
+    if not GEMINI_API_KEY:
+        print("[EMBED] GEMINI_API_KEY not set — skipping embedding")
+        return None
+    session = await get_session()
+    url = GEMINI_EMBED_API.format(model=EMBED_MODEL)
+    try:
+        async with session.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            json={"content": {"parts": [{"text": text}]}},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                body = (await resp.text())[:300]
+                print(f"[EMBED] Gemini returned {resp.status}: {body}")
+                return None
+            data = await resp.json()
+            return data.get("embedding", {}).get("values")
+    except Exception as e:
+        print(f"[EMBED] Failed to embed text: {e}")
+        return None
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+def _rank_and_select(query_emb: list[float], embeddings: dict[str, list[float]]) -> list:
+    """Shared scoring/selection logic for both the Gemini and local embedding
+    spaces. embeddings must be in the same vector space as query_emb — never
+    mix a Gemini query embedding with locally-embedded tool vectors or vice
+    versa, the cosine scores would be meaningless."""
+    scored = []
+    for schema in OLLAMA_SCHEMAS:
+        name = schema["function"]["name"]
+        if name in CORE_TOOLS:
+            continue  # added unconditionally below
+        emb = embeddings.get(name)
+        # No embedding on file for this tool (embed call failed at startup) —
+        # include it rather than silently hiding a tool from the model.
+        score = cosine_similarity(query_emb, emb) if emb is not None else 1.0
+        scored.append((score, schema))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    top = [schema for _, schema in scored[:TOOL_TOP_K]]
+
+    core_schemas = [s for s in OLLAMA_SCHEMAS if s["function"]["name"] in CORE_TOOLS]
+    return core_schemas + top
+
+async def _embed_tools_to_cache(
+    embed_fn, cache_file: Path, embeddings_out: dict[str, list[float]]
+) -> None:
+    """Shared cache-then-embed loop used by both the Gemini (startup) and
+    local (lazy, on first need) tool-embedding passes."""
+    cache = {}
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+
+    changed = False
+    from_cache = 0
+    for schema in OLLAMA_SCHEMAS:
+        fn = schema["function"]
+        text = f"{fn['name']}: {fn['description']}"
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        cached_entry = cache.get(fn["name"])
+        if cached_entry and cached_entry.get("hash") == text_hash:
+            embeddings_out[fn["name"]] = cached_entry["embedding"]
+            from_cache += 1
+            continue
+
+        emb = await embed_fn(text)
+        if emb is not None:
+            embeddings_out[fn["name"]] = emb
+            cache[fn["name"]] = {"hash": text_hash, "embedding": emb}
+            changed = True
+        else:
+            print(f"[EMBED] Skipped {fn['name']} — no embedding, will always be included")
+
+    if changed:
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        except OSError as e:
+            print(f"[EMBED] Failed to write embedding cache ({cache_file.name}): {e}")
+
+    print(f"[EMBED] {len(embeddings_out)}/{len(OLLAMA_SCHEMAS)} tool schemas ready via "
+          f"{cache_file.stem} ({from_cache} from cache, {len(embeddings_out) - from_cache} newly embedded)")
+
+async def embed_all_tools():
+    """Run once at startup — Gemini is the primary embedding path, so this
+    always runs regardless of which chat backend ends up serving messages."""
+    if TOOL_EMBEDDINGS:
+        return  # already done — on_ready can fire more than once on reconnect
+    await _embed_tools_to_cache(get_embedding, TOOL_EMBED_CACHE_FILE, TOOL_EMBEDDINGS)
+
+async def get_local_embedding(text: str) -> "list[float] | None":
+    session = await get_session()
+    try:
+        async with session.post(
+            LOCAL_EMBED_API,
+            json={"model": LOCAL_EMBED_MODEL, "prompt": text},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            return data.get("embedding")
+    except Exception as e:
+        print(f"[EMBED] Failed to get local embedding: {e}")
+        return None
+
+async def select_relevant_tools_local(query: str) -> "list | None":
+    """Last-resort path: only called when Gemini's embedding failed AND chat
+    is already running on the local fallback model. Lazily embeds tools into
+    a SEPARATE local-space cache on first use — Gemini and nomic embeddings
+    live in different vector spaces and are never compared against each
+    other. Returns None (caller falls back to the unfiltered tool list) if
+    the local embed model isn't reachable either."""
+    if not TOOL_EMBEDDINGS_LOCAL:
+        await _embed_tools_to_cache(get_local_embedding, TOOL_EMBED_LOCAL_CACHE_FILE, TOOL_EMBEDDINGS_LOCAL)
+        if not TOOL_EMBEDDINGS_LOCAL:
+            return None  # local embed model unreachable too — give up gracefully
+
+    query_emb = await get_local_embedding(query)
+    if query_emb is None:
+        return None
+
+    return _rank_and_select(query_emb, TOOL_EMBEDDINGS_LOCAL)
+
+async def select_relevant_tools(query: str) -> list:
+    """Returns the subset of OLLAMA_SCHEMAS worth sending for this query.
+
+    Tiered fallback:
+      1. Gemini embedding (primary, no local load).
+      2. If Gemini fails AND chat is currently on the local fallback model
+         (LAST_CHAT_BACKEND == "local"), try local nomic-embed-text — this is
+         the one case where an unfiltered tool dump would actually overflow
+         the local model's context window, so it's worth the local load.
+      3. Otherwise (Gemini fails but chat is on the cloud model, or local
+         embedding also fails), fall back to the full unfiltered tool list —
+         harmless on cloud context, and never silently disables tool use.
+    """
+    if not TOOL_EMBEDDINGS:
+        return OLLAMA_SCHEMAS
+
+    query_emb = await get_embedding(query)
+    if query_emb is not None:
+        return _rank_and_select(query_emb, TOOL_EMBEDDINGS)
+
+    if LAST_CHAT_BACKEND == "local":
+        local_result = await select_relevant_tools_local(query)
+        if local_result is not None:
+            return local_result
+
+    return OLLAMA_SCHEMAS
 
 # --- PERSISTENT USER MEMORY ---
 MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
@@ -516,6 +719,7 @@ async def on_ready():
     if not scheduler_tick.is_running():
         scheduler_tick.start()
     await start_webhook_server()
+    await embed_all_tools()
 
     # Only announce once per process start — on_ready can fire again on reconnects
     if not _startup_notified:
@@ -631,6 +835,7 @@ async def on_message(message):
     running = True
 
     ACTIVE_TASKS[user_id] = asyncio.current_task()
+    relevant_tools = await select_relevant_tools(user_query)
 
     try:
         async with message.channel.typing():
@@ -638,7 +843,7 @@ async def on_message(message):
                 payload = {
                     "model": MODEL_NAME,
                     "messages": messages,
-                    "tools": OLLAMA_SCHEMAS,
+                    "tools": relevant_tools,
                     "stream": False
                 }
                 
