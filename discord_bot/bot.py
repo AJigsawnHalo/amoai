@@ -6,6 +6,7 @@ import hashlib
 import time
 import base64
 import io
+import sqlite3
 import importlib
 import pkgutil
 import inspect
@@ -424,72 +425,158 @@ async def select_relevant_tools(query: str) -> list:
 
     return OLLAMA_SCHEMAS
 
-# --- PERSISTENT USER MEMORY ---
-MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
-MAX_FACTS_PER_USER = 40 
+# --- PERSISTENT USER MEMORY (SQLite-backed) ---
+# Was a flat memory_store.json capped at 40 facts/user. Moved to SQLite
+# (same pattern as tools/rag_knowledge.py's vector store) so raising the cap
+# is just a number, not a rewrite, and per-user lookups don't require
+# loading every other user's facts into memory first.
+MEMORY_DB_PATH = Path(__file__).resolve().parent / "data" / "memory_store.sqlite3"
+MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+LEGACY_MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
+MAX_FACTS_PER_USER = 200  # was 40 on the old JSON store
 
-def load_all_memory() -> dict:
-    if not MEMORY_FILE.exists():
-        return {}
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+def _get_memory_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            fact TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, fact)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_user ON facts(user_id)")
+    return conn
 
-def save_all_memory(data: dict):
+def _migrate_legacy_json_memory():
+    """One-time migration from the old memory_store.json into SQLite. Runs
+    at import time; no-ops once the JSON file is gone or already migrated
+    (renamed to .json.migrated on success, so this only ever runs once)."""
+    if not LEGACY_MEMORY_FILE.exists():
+        return
     try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except OSError as e:
-        print(f"[MEMORY] Failed to save memory store: {e}")
+        with open(LEGACY_MEMORY_FILE, "r", encoding="utf-8") as f:
+            legacy_data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[MEMORY] Couldn't read legacy {LEGACY_MEMORY_FILE.name}, leaving it in place: {e}")
+        return
+
+    conn = _get_memory_conn()
+    migrated_any = False
+    try:
+        for user_id, facts in legacy_data.items():
+            for fact in facts:
+                fact = fact.strip()
+                if not fact:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO facts (user_id, fact, created_at) VALUES (?, ?, ?)",
+                    (str(user_id), fact, datetime.now(timezone.utc).isoformat()),
+                )
+                migrated_any = True
+        conn.commit()
+    finally:
+        conn.close()
+
+    if migrated_any:
+        backup_path = LEGACY_MEMORY_FILE.with_suffix(".json.migrated")
+        try:
+            LEGACY_MEMORY_FILE.rename(backup_path)
+            print(f"[MEMORY] Migrated {LEGACY_MEMORY_FILE.name} into SQLite -> {backup_path.name}")
+        except OSError as e:
+            print(f"[MEMORY] Migrated to SQLite but couldn't rename old file: {e}")
+
+_migrate_legacy_json_memory()
 
 def get_user_facts(user_id: str) -> list:
-    return load_all_memory().get(str(user_id), [])
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT fact FROM facts WHERE user_id = ? ORDER BY id ASC",
+            (str(user_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows]
 
 def add_user_facts(user_id: str, new_facts: list) -> list:
     if not new_facts:
         return []
-    data = load_all_memory()
-    facts = data.setdefault(str(user_id), [])
+    conn = _get_memory_conn()
     added = []
-    for fact in new_facts:
-        fact = fact.strip()
-        if fact and fact not in facts:
-            facts.append(fact)
-            added.append(fact)
-    data[str(user_id)] = facts[-MAX_FACTS_PER_USER:]
-    save_all_memory(data)
+    try:
+        for fact in new_facts:
+            fact = fact.strip()
+            if not fact:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO facts (user_id, fact, created_at) VALUES (?, ?, ?)",
+                (str(user_id), fact, datetime.now(timezone.utc).isoformat()),
+            )
+            if cur.rowcount:
+                added.append(fact)
+        conn.commit()
+
+        # Enforce the per-user cap by trimming the oldest rows beyond it,
+        # same "keep the newest N" behavior the old JSON store had.
+        count = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE user_id = ?", (str(user_id),)
+        ).fetchone()[0]
+        if count > MAX_FACTS_PER_USER:
+            overflow = count - MAX_FACTS_PER_USER
+            conn.execute(
+                """
+                DELETE FROM facts WHERE id IN (
+                    SELECT id FROM facts WHERE user_id = ? ORDER BY id ASC LIMIT ?
+                )
+                """,
+                (str(user_id), overflow),
+            )
+            conn.commit()
+    finally:
+        conn.close()
     return added
 
-def clear_user_facts(user_id: str):
-    data = load_all_memory()
-    if str(user_id) in data:
-        del data[str(user_id)]
-        save_all_memory(data)
-
 def remove_user_fact(user_id: str, identifier: str):
-    data = load_all_memory()
-    facts = data.get(str(user_id), [])
-    if not facts:
-        return None
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, fact FROM facts WHERE user_id = ? ORDER BY id ASC",
+            (str(user_id),),
+        ).fetchall()
+        if not rows:
+            return None
 
-    if identifier.isdigit():
-        idx = int(identifier) - 1
-        if 0 <= idx < len(facts):
-            removed = facts.pop(idx)
-            data[str(user_id)] = facts
-            save_all_memory(data)
-            return removed
-        return None
+        target_id, target_fact = None, None
+        if identifier.isdigit():
+            idx = int(identifier) - 1
+            if 0 <= idx < len(rows):
+                target_id, target_fact = rows[idx]
+        else:
+            for row_id, fact in rows:
+                if fact.lower() == identifier.strip().lower():
+                    target_id, target_fact = row_id, fact
+                    break
 
-    for i, fact in enumerate(facts):
-        if fact.lower() == identifier.strip().lower():
-            removed = facts.pop(i)
-            data[str(user_id)] = facts
-            save_all_memory(data)
-            return removed
-    return None
+        if target_id is None:
+            return None
+
+        conn.execute("DELETE FROM facts WHERE id = ?", (target_id,))
+        conn.commit()
+        return target_fact
+    finally:
+        conn.close()
+
+def clear_user_facts(user_id: str):
+    conn = _get_memory_conn()
+    try:
+        conn.execute("DELETE FROM facts WHERE user_id = ?", (str(user_id),))
+        conn.commit()
+    finally:
+        conn.close()
 
 async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
     extraction_prompt = (
