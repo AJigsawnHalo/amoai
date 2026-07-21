@@ -1,50 +1,21 @@
-aiodns==4.0.4
-async_timeout==5.0.1
-blinker==1.9.0
-brotli==1.2.0
-brotlicffi==1.2.0.1
-ca_certs_locater==1.0
-click==8.4.2
-ConfigParser==7.2.0
-contextlib2==21.6.0
-davey==0.1.6
-docutils==0.23
-filelock==3.31.0
-grpc_status==1.0.0
-gunicorn==26.0.0
-h2==4.3.0
-HTMLParser==0.0.2
-importlib_metadata==9.0.0
-ipython==8.12.3
-ipywidgets==8.1.8
-Jinja2==3.1.6
-jnius==1.1.0
-js==1.0
-keyring==25.7.0
-mask==1.0.0
-mock==5.2.0
-nacl==0.0.0
-numpy==2.5.1
-oauth2client==4.1.3
-orjson==3.11.9
-Pillow==12.3.0
-pydantic==2.13.4
-pydantic_core==2.47.0
-pyodide==0.0.2
-pyOpenSSL==26.3.0
+# Discord bot
+discord.py==2.7.1
+
+# Async HTTP client (bot.py <-> Ollama, embeddings) + sync HTTP (tools using requests)
+aiohttp==3.14.2
+requests==2.34.2
+
+# .env config loading (used throughout bot.py, tools/, email-monitor/, log-monitor/)
+python-dotenv==1.2.2
+
+# System stats for tools/server_status.py
+psutil==7.2.2
+
+# PDF text extraction for file attachments (bot.py) and tools/rag_knowledge.py
 pypdf==6.14.2
 PyPDF2==3.0.1
-pytest==9.1.1
-python_bcrypt==0.3.2
-pyu2f==0.1.5
-railroad==0.5.0
-redis==8.0.1
-setuptools==83.0.0
-simplejson==4.1.1
-Sphinx==9.1.0
-thread==2.0.6
-tornado==6.5.7
-urllib3_secure_extra==0.1.0
-uvloop==0.22.1
-xmlrpclib==1.0.1
-zstandard==0.25.0
+
+# Google Calendar integration (tools/calendar_tool.py, setup_google_calendar_auth.py)
+google-api-python-client==2.198.0
+google-auth==2.56.0
+google-auth-oauthlib==1.4.0
