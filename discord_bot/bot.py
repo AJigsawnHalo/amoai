@@ -20,6 +20,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv, find_dotenv
 import tools
 from tools.reminder_tool import _get_due_arrival_reminders, _get_due_time_reminders, BOT_TIMEZONE
+from scheduled_briefing import build_briefing
 
 # --- CONFIGURATION ---
 load_dotenv(find_dotenv())
@@ -693,6 +694,27 @@ async def check_scheduled_reminders() -> str | None:
 
 register_job("Reminder Alert", 60, check_scheduled_reminders)
 
+# --- MORNING BRIEFING ---
+# Fires once per day at/after MORNING_BRIEFING_HOUR (default 6am, in
+# BOT_TIMEZONE). Gated by _last_briefing_date rather than a fixed
+# interval_seconds, since register_job's interval is measured from
+# whenever the bot last happened to start — that drifts over restarts and
+# wouldn't reliably land at the same wall-clock hour every day.
+MORNING_BRIEFING_HOUR = int(os.getenv("MORNING_BRIEFING_HOUR", 6))
+_last_briefing_date = None
+
+async def check_morning_briefing() -> str | None:
+    global _last_briefing_date
+    now = datetime.now(BOT_TIMEZONE)
+    if now.hour < MORNING_BRIEFING_HOUR:
+        return None
+    if _last_briefing_date == now.date():
+        return None
+    _last_briefing_date = now.date()
+    return await asyncio.to_thread(build_briefing)
+
+register_job("Morning Briefing", 60, check_morning_briefing)
+
 @tasks.loop(seconds=60)
 async def scheduler_tick():
     if not ALLOWED_CHANNEL_ID:
@@ -1204,3 +1226,4 @@ async def on_message(message):
             del ACTIVE_TASKS[user_id]
 
 bot.run(TOKEN)
+
