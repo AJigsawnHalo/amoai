@@ -3,6 +3,9 @@ import re
 import sys
 import time
 import json
+import ssl
+import socket
+import fcntl
 import imaplib
 import email
 import requests
@@ -165,7 +168,7 @@ def get_email_body(msg):
 
 def process_emails(user, password):
     """Connects to IMAP and processes pending unseen messages."""
-    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
     try:
         mail.login(user, password)
         mail.select("inbox")
@@ -222,6 +225,20 @@ def process_emails(user, password):
             pass
 
 
+def process_emails_with_retry(user, password, retries=1):
+    """Wraps process_emails with one retry on transient SSL/socket errors."""
+    for attempt in range(retries + 1):
+        try:
+            process_emails(user, password)
+            return
+        except (ssl.SSLError, socket.error, imaplib.IMAP4.abort) as e:
+            if attempt < retries:
+                print(f"  → Transient error ({e}), retrying in 5s...", file=sys.stderr)
+                time.sleep(5)
+            else:
+                raise
+
+
 def run_task(task_type):
     # Check if a text block was piped directly via terminal
     if not sys.stdin.isatty():
@@ -243,27 +260,39 @@ def run_task(task_type):
             return
 
         # 2. ACTIVE MONITOR MODE (No input piped; check active email accounts)
-        accounts_raw = os.getenv("EMAIL_ACCOUNTS")
-        if not accounts_raw:
-            print("Error: EMAIL_ACCOUNTS not defined in environment.", file=sys.stderr)
-            return
+        lock_path = "/tmp/amoai_email_monitor.lock"
+        lock_fd = open(lock_path, "w")
         try:
-            accounts = json.loads(accounts_raw)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing EMAIL_ACCOUNTS JSON structure: {e}", file=sys.stderr)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another email monitor run is already in progress, skipping.", file=sys.stderr)
             return
 
-        for account in accounts:
-            user = account.get("user")
-            password = account.get("password")
-            if not user or not password:
-                continue
-            print(f"\n--- Checking {user} ---")
+        try:
+            accounts_raw = os.getenv("EMAIL_ACCOUNTS")
+            if not accounts_raw:
+                print("Error: EMAIL_ACCOUNTS not defined in environment.", file=sys.stderr)
+                return
             try:
-                process_emails(user, password)
-            except Exception as e:
-                print(f"  → Failed: {e}", file=sys.stderr)
-                send_failure_alert(user, str(e))
+                accounts = json.loads(accounts_raw)
+            except json.JSONDecodeError as e:
+                print(f"Error parsing EMAIL_ACCOUNTS JSON structure: {e}", file=sys.stderr)
+                return
+
+            for account in accounts:
+                user = account.get("user")
+                password = account.get("password")
+                if not user or not password:
+                    continue
+                print(f"\n--- Checking {user} ---")
+                try:
+                    process_emails_with_retry(user, password)
+                except Exception as e:
+                    print(f"  → Failed: {e}", file=sys.stderr)
+                    send_failure_alert(user, str(e))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
     else:
         print(f"Error: Unknown task type '{task_type}'", file=sys.stderr)
 
