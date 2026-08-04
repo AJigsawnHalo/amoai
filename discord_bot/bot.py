@@ -6,6 +6,7 @@ import hashlib
 import time
 import base64
 import io
+import zipfile
 import sqlite3
 import importlib
 import pkgutil
@@ -858,6 +859,14 @@ TEXT_FILE_EXTENSIONS = {
 MAX_FILE_ATTACHMENT_BYTES = 2_000_000  # cap on raw bytes we'll download per file
 MAX_FILE_TEXT_CHARS = 20_000         # cap on extracted text injected per file
 
+# Archive-specific caps — a small zip can decompress into something huge, so
+# these guard against zip bombs independently of MAX_FILE_ATTACHMENT_BYTES
+# (which only limits the *compressed* download size).
+ARCHIVE_EXTENSIONS = {".zip"}
+MAX_ARCHIVE_ENTRIES = 50            # refuse to walk archives with more files than this
+MAX_ARCHIVE_TOTAL_BYTES = 5_000_000  # cap on total decompressed bytes we'll read
+MAX_ARCHIVE_TEXT_CHARS = 40_000     # cap on combined extracted text for the whole archive
+
 
 async def _download_attachment(attachment: "discord.Attachment", max_bytes: int) -> "bytes | None":
     """Downloads an attachment's bytes, refusing anything over max_bytes.
@@ -903,6 +912,71 @@ def _extract_pdf_text(data: bytes, max_chars: int) -> str:
     return joined or "[No extractable text found — this PDF may be scanned/image-based.]"
 
 
+def _extract_zip_text(data: bytes, filename: str) -> str:
+    """Extracts and concatenates text-file contents from a zip archive,
+    reusing TEXT_FILE_EXTENSIONS to decide what's worth reading. Bails out
+    early on anything that looks like a zip bomb (too many entries, or too
+    much declared/decompressed content) instead of trying to read it."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return f"[Could not open `{filename}` — not a valid zip file.]"
+
+    infos = [i for i in zf.infolist() if not i.is_dir()]
+
+    if len(infos) > MAX_ARCHIVE_ENTRIES:
+        return (f"[Refused to read `{filename}` — {len(infos)} files exceeds "
+                f"the {MAX_ARCHIVE_ENTRIES}-entry limit.]")
+
+    declared_total = sum(i.file_size for i in infos)
+    if declared_total > MAX_ARCHIVE_TOTAL_BYTES:
+        return (f"[Refused to read `{filename}` — decompressed contents "
+                f"({declared_total} bytes) exceed the "
+                f"{MAX_ARCHIVE_TOTAL_BYTES}-byte limit. Possible zip bomb.]")
+
+    blocks = []
+    skipped = []
+    read_total = 0
+
+    for info in infos:
+        suffix = Path(info.filename).suffix.lower()
+        if suffix not in TEXT_FILE_EXTENSIONS and suffix != "":
+            skipped.append(info.filename)
+            continue
+
+        read_total += info.file_size
+        if read_total > MAX_ARCHIVE_TOTAL_BYTES:
+            skipped.append(f"{info.filename} (over total-size cap)")
+            continue
+
+        try:
+            raw = zf.read(info)
+        except (zipfile.BadZipFile, RuntimeError) as e:
+            skipped.append(f"{info.filename} (read error: {e})")
+            continue
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped.append(f"{info.filename} (not text)")
+            continue
+
+        blocks.append(f"  [{info.filename}]\n{text}")
+
+    combined = "\n\n".join(blocks).strip()
+    if len(combined) > MAX_ARCHIVE_TEXT_CHARS:
+        combined = combined[:MAX_ARCHIVE_TEXT_CHARS] + "\n...[truncated]"
+
+    if not combined:
+        combined = "[No readable text files found in archive.]"
+
+    if skipped:
+        combined += f"\n\n[Skipped {len(skipped)} entries: {', '.join(skipped[:10])}" \
+                     f"{' ...' if len(skipped) > 10 else ''}]"
+
+    return combined
+
+
 async def process_image_attachments(attachments: "list[discord.Attachment]") -> "tuple[list[str], list[str]]":
     """Downloads image attachments and base64-encodes them for the Ollama
     'images' field. Returns (base64_images, notes) — notes are skip/error
@@ -928,6 +1002,53 @@ async def process_image_attachments(attachments: "list[discord.Attachment]") -> 
     return images_b64, notes
 
 
+async def describe_images_for_tools(images_b64: "list[str]", user_query: str, channel=None) -> "str | None":
+    """Vision pre-pass: sends the image(s) to the cloud model ALONE (no tools),
+    since gemma4:cloud (and most vision models) can 500 when 'images' and
+    'tools' are present in the same request. The returned text description is
+    folded into the user's message as plain text so the normal tool-calling
+    loop downstream never has to carry an 'images' field. Returns None on
+    failure so the caller can fall back to a plain notice instead of crashing."""
+    vision_prompt = (
+        user_query.strip()
+        or "Describe this image in detail, including any visible text, numbers, or data (OCR anything readable)."
+    )
+    vision_payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a vision module. Describe the attached image(s) thoroughly: "
+                    "objects, layout, and — most importantly — transcribe any visible text, "
+                    "numbers, labels, or data exactly as written. Be precise and complete; "
+                    "another AI with no eyes will rely entirely on your description."
+                ),
+            },
+            {"role": "user", "content": vision_prompt, "images": images_b64},
+        ],
+        # NOTE: no "tools" key here at all — sending "tools": [] (empty list)
+        # made gemma4:cloud 500 every time (confirmed via failed_payload
+        # dumps: identical 500 across 3 retries, only difference being the
+        # empty tools array). Omitting the key entirely is what actually
+        # means "no tools" for this backend.
+        "stream": False,
+    }
+    try:
+        response = await query_llm(vision_payload, timeout=90, channel=channel)
+    except Exception as e:
+        print(f"[VISION] Image description pass failed: {e}")
+        return None
+
+    if LAST_CHAT_BACKEND != "cloud":
+        # Fell back to the local model, which can't see images either —
+        # query_llm already strips "images" before that call, so a
+        # "successful" local response here would just be a hallucination.
+        return None
+
+    return response.get("message", {}).get("content", "") or None
+
+
 async def process_file_attachments(attachments: "list[discord.Attachment]") -> "tuple[str, list[str]]":
     """Downloads non-image attachments and extracts their text (PDF or plain
     text), returning a context block ready to append to the user's message,
@@ -948,6 +1069,8 @@ async def process_file_attachments(attachments: "list[discord.Attachment]") -> "
 
         if suffix == ".pdf":
             text = await asyncio.to_thread(_extract_pdf_text, data, MAX_FILE_TEXT_CHARS)
+        elif suffix in ARCHIVE_EXTENSIONS:
+            text = await asyncio.to_thread(_extract_zip_text, data, att.filename)
         elif suffix in TEXT_FILE_EXTENSIONS or suffix == "":
             try:
                 text = data.decode("utf-8")
@@ -1014,6 +1137,29 @@ async def on_message(message):
         attachment_notes = image_notes + file_notes
         if attachment_notes:
             await send_chunked(message.channel, "\n".join(attachment_notes))
+
+    # --- VISION PRE-PASS: describe images as text BEFORE the tool-calling
+    # loop starts. gemma4:cloud (like most vision models) can 500 when
+    # "images" and "tools" are both present in one request, so images never
+    # travel alongside "tools" — they're converted to a text description
+    # here instead, and the main loop below never sees an "images" field. ---
+    had_images = bool(pending_images_b64)
+    if pending_images_b64:
+        await send_chunked(message.channel, "👀 Looking at the image(s)...")
+        async with message.channel.typing():
+            image_description = await describe_images_for_tools(pending_images_b64, user_query, message.channel)
+        if image_description:
+            user_query = (
+                f"{user_query}\n\n[Image content — extracted by vision pass]\n{image_description}"
+                if user_query else
+                f"[Image content — extracted by vision pass]\n{image_description}"
+            )
+        else:
+            await send_chunked(
+                message.channel,
+                "⚠️ Couldn't get a description of the attached image(s) — continuing without them."
+            )
+        pending_images_b64 = []  # already folded into user_query as text; never attach raw images downstream
 
     trigger = user_query.strip().lower()
 
@@ -1097,11 +1243,11 @@ async def on_message(message):
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
         "You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. If you need to represent a matrix or a table, use a plain text grid or a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
         f"\n\nCurrent date and time (GMT+8): {datetime.now(BOT_TIMEZONE).strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
-        + ("\n\nThe user has attached one or more images to this message — you can see "
-           "them directly, so describe or analyze them instead of saying you can't view "
-           "images. (If you were quietly switched to the local fallback model, the "
-           "images were dropped before reaching you — say so if asked about them.)"
-           if pending_images_b64 else "")
+        + ("\n\nThe user attached one or more images to this message. You don't see the "
+           "raw image — a separate vision pass already described/OCR'd it, and that "
+           "description is inlined below under '[Image content — extracted by vision "
+           "pass]'. Treat that as what you saw; don't say you can't view images."
+           if had_images else "")
         + ("\n\nThe user attached one or more files to this message — their text content "
            "has been inlined below under '[Attached file contents below]'. Treat that as "
            "read, not something you need a tool to fetch."
