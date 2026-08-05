@@ -3,6 +3,7 @@ import sys
 import asyncio
 import json
 import hashlib
+import re
 import time
 import base64
 import io
@@ -16,7 +17,7 @@ from aiohttp import web
 import discord
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import deque
 from discord.ext import commands, tasks
 from dotenv import load_dotenv, find_dotenv
 import tools
@@ -208,8 +209,85 @@ def needs_confirmation(name: str, args: dict) -> bool:
     return False
 
 # --- CONVERSATION MEMORY ---
-HISTORY_TURNS = 10 
-CHANNEL_HISTORY = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
+# Per-channel rolling window, kept in memory for fast access during a
+# session. Threads get a larger window than the main channel — a thread is
+# a dedicated, bounded conversation (like a Claude chat), so it's worth
+# keeping more of it around; the main channel is shared/ambient, so a
+# tighter window keeps the prompt from dragging in unrelated topics.
+HISTORY_TURNS = 10
+THREAD_HISTORY_TURNS = 40
+# Independent of the in-memory window above — this is how much of a
+# channel's/thread's history survives in SQLite across bot restarts, so
+# reopening an old thread days later doesn't come back empty.
+CONVERSATION_LOG_MAX_PER_CHANNEL = 500
+
+CHANNEL_HISTORY: dict[int, deque] = {}
+_HYDRATED_CHANNELS: set[int] = set()
+
+def _history_cap_messages(channel) -> int:
+    turns = THREAD_HISTORY_TURNS if isinstance(channel, discord.Thread) else HISTORY_TURNS
+    return turns * 2
+
+def _load_conversation_log(channel_id, limit_messages: int) -> list:
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT role, content FROM conversation_log WHERE channel_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (str(channel_id), limit_messages),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+def _append_conversation_log(channel_id, role: str, content: str):
+    conn = _get_memory_conn()
+    try:
+        conn.execute(
+            "INSERT INTO conversation_log (channel_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (str(channel_id), role, content, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM conversation_log WHERE channel_id = ?", (str(channel_id),)
+        ).fetchone()[0]
+        if count > CONVERSATION_LOG_MAX_PER_CHANNEL:
+            overflow = count - CONVERSATION_LOG_MAX_PER_CHANNEL
+            conn.execute(
+                """
+                DELETE FROM conversation_log WHERE id IN (
+                    SELECT id FROM conversation_log WHERE channel_id = ? ORDER BY id ASC LIMIT ?
+                )
+                """,
+                (str(channel_id), overflow),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+def get_channel_history(channel) -> deque:
+    """Returns the in-memory rolling-history deque for this channel/thread,
+    hydrating it from the persistent conversation_log on first touch since
+    process start so a bot restart doesn't blank out an in-progress thread."""
+    cid = channel.id
+    if cid not in CHANNEL_HISTORY:
+        cap = _history_cap_messages(channel)
+        history = deque(maxlen=cap)
+        if cid not in _HYDRATED_CHANNELS:
+            history.extend(_load_conversation_log(cid, cap))
+            _HYDRATED_CHANNELS.add(cid)
+        CHANNEL_HISTORY[cid] = history
+    return CHANNEL_HISTORY[cid]
+
+def record_turn(channel, user_query: str, response_text: str):
+    """Appends a user/assistant exchange to both the in-memory window and
+    the persistent log — call this everywhere a turn currently gets pushed
+    onto CHANNEL_HISTORY."""
+    history = get_channel_history(channel)
+    history.append({"role": "user", "content": user_query})
+    history.append({"role": "assistant", "content": response_text})
+    _append_conversation_log(channel.id, "user", user_query)
+    _append_conversation_log(channel.id, "assistant", response_text)
 
 # --- ACTIVE TASK TRACKING ---
 ACTIVE_TASKS: dict[str, asyncio.Task] = {}
@@ -437,6 +515,37 @@ MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 LEGACY_MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
 MAX_FACTS_PER_USER = 200  # was 40 on the old JSON store
 
+# Two facts whose embeddings score at or above this are treated as the same
+# fact and never stored twice — catches near-duplicate phrasing ("likes
+# coffee" vs "really likes coffee in the morning") that the exact-string
+# UNIQUE constraint alone would miss.
+FACT_DEDUP_THRESHOLD = 0.93
+# Fact lists at or under this size are injected into the system prompt
+# whole — not worth the embedding/ranking overhead. Above it, only the
+# FACT_RELEVANCE_TOP_K most relevant facts to the current message go in, so
+# the prompt doesn't grow unbounded as a user's fact count approaches
+# MAX_FACTS_PER_USER.
+FACT_INJECT_ALWAYS_UNDER = 8
+FACT_RELEVANCE_TOP_K = 8
+
+# Cheap pre-filter so extract_and_store_facts doesn't burn an LLM call on
+# every single message (most messages are acknowledgments or one-off
+# requests with nothing durable in them). False negatives here just mean a
+# fact-bearing message got skipped — it almost always resurfaces in a later,
+# more substantive message, so skipping is low-risk; the alternative is
+# paying for an extraction call on every "ok thanks".
+_LOW_SIGNAL_PATTERN = re.compile(
+    r"^(ok(ay)?|k+|thanks?( you)?|thx|ty|cool|nice|lol+|lmao+|yes|yep|yeah|no|nope|"
+    r"sure|got ?it|alright|sounds good|np|welcome)[.!?]*$",
+    re.IGNORECASE,
+)
+
+def _looks_low_signal(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 12:
+        return True
+    return bool(_LOW_SIGNAL_PATTERN.match(stripped))
+
 def _get_memory_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(MEMORY_DB_PATH)
     conn.execute(
@@ -451,7 +560,64 @@ def _get_memory_conn() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_user ON facts(user_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_convlog_channel ON conversation_log(channel_id)")
+    # Additive migration for DBs created before updated_at/embedding existed.
+    # ADD COLUMN has no "IF NOT EXISTS" in SQLite, so this just no-ops with
+    # an OperationalError ("duplicate column") on every run after the first.
+    for ddl in (
+        "ALTER TABLE facts ADD COLUMN updated_at TEXT",
+        "ALTER TABLE facts ADD COLUMN embedding TEXT",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
     return conn
+
+def _encode_embedding(embedding: "tuple[str, list[float]] | None") -> "str | None":
+    if not embedding:
+        return None
+    space, vector = embedding
+    if not vector:
+        return None
+    return json.dumps({"space": space, "vector": vector})
+
+def _parse_embedding(raw: "str | None") -> "tuple[str, list[float]] | None":
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+        vector = obj.get("vector")
+        return (obj.get("space"), vector) if vector else None
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+async def _embed_fact(text: str) -> "tuple[str, list[float]] | None":
+    """Tiered embedding for a fact or a query string — same fallback order
+    as select_relevant_tools(): Gemini primary, local nomic only when chat is
+    currently on the local backend. Returns (space, vector) rather than a
+    bare vector so callers only ever compare vectors embedded in the same
+    space — Gemini and local vectors are never comparable to each other
+    (see the note on TOOL_EMBEDDINGS_LOCAL above)."""
+    emb = await get_embedding(text)
+    if emb is not None:
+        return "gemini", emb
+    if LAST_CHAT_BACKEND == "local":
+        emb = await get_local_embedding(text)
+        if emb is not None:
+            return "local", emb
+    return None
 
 def _migrate_legacy_json_memory():
     """One-time migration from the old memory_store.json into SQLite. Runs
@@ -504,43 +670,113 @@ def get_user_facts(user_id: str) -> list:
         conn.close()
     return [r[0] for r in rows]
 
-def add_user_facts(user_id: str, new_facts: list) -> list:
-    if not new_facts:
-        return []
+def get_user_facts_with_embeddings(user_id: str) -> list:
+    """Returns [(fact, (space, vector) | None), ...] for this user — used for
+    semantic dedup and relevance ranking. Facts stored before embeddings
+    existed, or whose embedding call failed at the time, come back with
+    None; callers treat those as always-relevant/always-distinct rather than
+    hiding them, same philosophy as select_relevant_tools() for tools with
+    no cached embedding."""
     conn = _get_memory_conn()
-    added = []
     try:
-        for fact in new_facts:
-            fact = fact.strip()
-            if not fact:
-                continue
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO facts (user_id, fact, created_at) VALUES (?, ?, ?)",
-                (str(user_id), fact, datetime.now(timezone.utc).isoformat()),
-            )
-            if cur.rowcount:
-                added.append(fact)
-        conn.commit()
-
-        # Enforce the per-user cap by trimming the oldest rows beyond it,
-        # same "keep the newest N" behavior the old JSON store had.
-        count = conn.execute(
-            "SELECT COUNT(*) FROM facts WHERE user_id = ?", (str(user_id),)
-        ).fetchone()[0]
-        if count > MAX_FACTS_PER_USER:
-            overflow = count - MAX_FACTS_PER_USER
-            conn.execute(
-                """
-                DELETE FROM facts WHERE id IN (
-                    SELECT id FROM facts WHERE user_id = ? ORDER BY id ASC LIMIT ?
-                )
-                """,
-                (str(user_id), overflow),
-            )
-            conn.commit()
+        rows = conn.execute(
+            "SELECT fact, embedding FROM facts WHERE user_id = ? ORDER BY id ASC",
+            (str(user_id),),
+        ).fetchall()
     finally:
         conn.close()
-    return added
+    return [(fact, _parse_embedding(raw)) for fact, raw in rows]
+
+def add_user_fact(user_id: str, fact: str, embedding: "tuple[str, list[float]] | None" = None) -> bool:
+    """Inserts a single fact. Returns False if it already exists verbatim for
+    this user (UNIQUE constraint) or the fact is blank — semantic near-dupes
+    should be filtered by the caller with _is_semantic_duplicate before this
+    is ever reached."""
+    fact = fact.strip()
+    if not fact:
+        return False
+    conn = _get_memory_conn()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO facts (user_id, fact, created_at, updated_at, embedding) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(user_id), fact, now, now, _encode_embedding(embedding)),
+        )
+        inserted = bool(cur.rowcount)
+        conn.commit()
+
+        if inserted:
+            # Enforce the per-user cap by trimming the oldest rows beyond it,
+            # same "keep the newest N" behavior the old JSON store had.
+            count = conn.execute(
+                "SELECT COUNT(*) FROM facts WHERE user_id = ?", (str(user_id),)
+            ).fetchone()[0]
+            if count > MAX_FACTS_PER_USER:
+                overflow = count - MAX_FACTS_PER_USER
+                conn.execute(
+                    """
+                    DELETE FROM facts WHERE id IN (
+                        SELECT id FROM facts WHERE user_id = ? ORDER BY id ASC LIMIT ?
+                    )
+                    """,
+                    (str(user_id), overflow),
+                )
+                conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+def update_user_fact(
+    user_id: str, old_fact: str, new_fact: str, embedding: "tuple[str, list[float]] | None" = None
+) -> "tuple[str, str] | None":
+    """Finds old_fact by case-insensitive exact match and rewrites its text
+    and embedding in place, preserving its row rather than appending — this
+    is what lets a revised fact ("moved to Manila") supersede the old one
+    ("lives in Calumpit") instead of both persisting side by side forever.
+    Returns (old_text, new_text) on success, or None if old_fact wasn't
+    found (the caller should then treat it as a plain add)."""
+    new_fact = new_fact.strip()
+    if not new_fact:
+        return None
+    conn = _get_memory_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, fact FROM facts WHERE user_id = ? AND lower(fact) = lower(?)",
+            (str(user_id), old_fact.strip()),
+        ).fetchone()
+        if not row:
+            return None
+        fact_id, old_text = row
+        conn.execute(
+            "UPDATE facts SET fact = ?, updated_at = ?, embedding = ? WHERE id = ?",
+            (new_fact, datetime.now(timezone.utc).isoformat(), _encode_embedding(embedding), fact_id),
+        )
+        conn.commit()
+        return old_text, new_fact
+    finally:
+        conn.close()
+
+def _is_semantic_duplicate(
+    embedding: "tuple[str, list[float]] | None", existing: list
+) -> bool:
+    """True if `embedding` is close enough to something already stored that
+    a new row isn't worth adding. Only ever compares within the same
+    embedding space (Gemini vs local vectors are not comparable — see
+    _embed_fact); if either side has no embedding this returns False rather
+    than silently dropping a fact it can't judge."""
+    if not embedding:
+        return False
+    space, vector = embedding
+    for _, existing_embedding in existing:
+        if not existing_embedding:
+            continue
+        existing_space, existing_vector = existing_embedding
+        if existing_space != space:
+            continue
+        if cosine_similarity(vector, existing_vector) >= FACT_DEDUP_THRESHOLD:
+            return True
+    return False
 
 def remove_user_fact(user_id: str, identifier: str):
     conn = _get_memory_conn()
@@ -553,15 +789,24 @@ def remove_user_fact(user_id: str, identifier: str):
             return None
 
         target_id, target_fact = None, None
+        identifier = identifier.strip()
         if identifier.isdigit():
             idx = int(identifier) - 1
             if 0 <= idx < len(rows):
                 target_id, target_fact = rows[idx]
         else:
+            lowered = identifier.lower()
+            # Exact match first, so a short fact that also happens to be a
+            # substring of a longer one doesn't get shadowed by it.
             for row_id, fact in rows:
-                if fact.lower() == identifier.strip().lower():
+                if fact.lower() == lowered:
                     target_id, target_fact = row_id, fact
                     break
+            if target_id is None:
+                for row_id, fact in rows:
+                    if lowered in fact.lower():
+                        target_id, target_fact = row_id, fact
+                        break
 
         if target_id is None:
             return None
@@ -580,15 +825,61 @@ def clear_user_facts(user_id: str):
     finally:
         conn.close()
 
+async def get_relevant_facts_block(user_id: str, query: str) -> str:
+    """Builds the "What you remember about this user" block for the system
+    prompt. Small fact lists are sent whole; larger ones are trimmed to the
+    FACT_RELEVANCE_TOP_K facts most relevant to the current message, so the
+    prompt doesn't grow unbounded as a user's fact count climbs toward
+    MAX_FACTS_PER_USER."""
+    facts_with_emb = get_user_facts_with_embeddings(user_id)
+    if not facts_with_emb:
+        return ""
+
+    if len(facts_with_emb) <= FACT_INJECT_ALWAYS_UNDER:
+        chosen = [f for f, _ in facts_with_emb]
+    else:
+        query_emb = await _embed_fact(query)
+        if query_emb is None:
+            # Can't rank without a query embedding — most-recent facts are a
+            # safer bet than an arbitrary truncation.
+            chosen = [f for f, _ in facts_with_emb[-FACT_RELEVANCE_TOP_K:]]
+        else:
+            q_space, q_vector = query_emb
+            scored = []
+            for fact, emb in facts_with_emb:
+                if emb and emb[0] == q_space:
+                    score = cosine_similarity(q_vector, emb[1])
+                else:
+                    score = 1.0  # no comparable embedding — never silently hide it
+                scored.append((score, fact))
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            chosen = [fact for _, fact in scored[:FACT_RELEVANCE_TOP_K]]
+
+    return "\n\nWhat you remember about this user:\n" + "\n".join(f"- {f}" for f in chosen)
+
 async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
+    if _looks_low_signal(user_query):
+        return
+
+    existing_facts = get_user_facts(user_id)
+    existing_block = "\n".join(f"- {f}" for f in existing_facts) if existing_facts else "(none yet)"
+
     extraction_prompt = (
-        "Below is a single message a user sent to a Discord bot. Decide if it "
-        "contains any NEW durable fact about the user worth remembering long-term "
-        "(name, role, preferences, ongoing projects, recurring routines, etc). "
-        "Ignore one-off requests, questions, or temporary details. "
-        "Reply with ONLY a JSON array of short fact strings (no markdown, no preamble). "
-        "If there is nothing worth remembering, reply with exactly: []\n\n"
-        f"Message: {user_query}"
+        "Below is a single message a user sent to a Discord bot, plus the facts "
+        "already remembered about this user. Decide whether the message contains "
+        "any NEW durable fact worth remembering long-term (name, role, "
+        "preferences, ongoing projects, recurring routines, etc), or whether it "
+        "REVISES/contradicts one of the existing facts (e.g. moved cities, "
+        "changed jobs, switched a preference). Ignore one-off requests, "
+        "questions, or temporary details.\n\n"
+        "Reply with ONLY a JSON object of this exact shape (no markdown, no "
+        "preamble):\n"
+        '{"add": ["new fact 1", ...], "update": [{"replaces": "<verbatim existing '
+        'fact text>", "with": "<revised fact text>"}]}\n'
+        "Only use \"update\" when \"replaces\" is copied verbatim from the "
+        "existing facts list below — never paraphrase it. If nothing applies, "
+        'reply with exactly {"add": [], "update": []}\n\n'
+        f"Existing facts:\n{existing_block}\n\nMessage: {user_query}"
     )
     payload = {
         "model": MODEL_NAME,
@@ -597,18 +888,51 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
     }
     try:
         response = await query_llm(payload, timeout=60)
-        raw = response.get("message", {}).get("content", "[]").strip()
+        raw = response.get("message", {}).get("content", "{}").strip()
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
-        facts = json.loads(raw)
-        if isinstance(facts, list):
-            added = add_user_facts(user_id, [str(f) for f in facts])
-            if added and channel is not None:
-                subtext = "\n".join(f"-# 🧠 remembered: {f}" for f in added)
-                await send_chunked(channel, subtext)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return
+        to_add = [str(f).strip() for f in parsed.get("add", []) if str(f).strip()]
+        to_update = [
+            u for u in parsed.get("update", [])
+            if isinstance(u, dict) and str(u.get("replaces", "")).strip() and str(u.get("with", "")).strip()
+        ]
     except Exception as e:
         print(f"[MEMORY] Extraction skipped (non-fatal): {e}")
+        return
+
+    updated_summaries = []
+    for u in to_update:
+        new_text = str(u["with"]).strip()
+        embedding = await _embed_fact(new_text)
+        result = update_user_fact(user_id, str(u["replaces"]), new_text, embedding)
+        if result:
+            updated_summaries.append(f"{result[0]} → {result[1]}")
+        else:
+            # "replaces" didn't match anything on file — treat as a fresh
+            # fact rather than silently dropping it.
+            to_add.append(new_text)
+
+    added = []
+    if to_add:
+        existing_for_dedup = get_user_facts_with_embeddings(user_id)
+        for fact in to_add:
+            if not fact:
+                continue
+            embedding = await _embed_fact(fact)
+            if _is_semantic_duplicate(embedding, existing_for_dedup):
+                continue
+            if add_user_fact(user_id, fact, embedding):
+                added.append(fact)
+                existing_for_dedup.append((fact, embedding))
+
+    if channel is not None and (added or updated_summaries):
+        lines = [f"-# 🧠 remembered: {f}" for f in added]
+        lines += [f"-# 🧠 updated: {s}" for s in updated_summaries]
+        await send_chunked(channel, "\n".join(lines))
 
 DISCORD_LIMIT = 2000
 
@@ -1088,6 +1412,57 @@ async def process_file_attachments(attachments: "list[discord.Attachment]") -> "
     return "\n\n".join(blocks), notes
 
 
+# --- AUTOMATIC THREAD SUGGESTION ---
+_LAST_THREAD_SUGGESTION_TURN: dict[int, int] = {}
+THREAD_SUGGESTION_THRESHOLD = 6   # messages in history before suggesting
+THREAD_SUGGESTION_COOLDOWN = 10   # messages before asking again after a decline/timeout
+THREAD_SEED_MESSAGES = 6          # most recent messages copied into the new thread for continuity
+
+async def maybe_suggest_thread(message, history_length: int):
+    """Checks if the conversation is getting long and offers to spin up a thread,
+    using the built-in reaction confirmation system."""
+    channel_id = message.channel.id
+    
+    if isinstance(message.channel, discord.Thread):
+        return
+
+    last_suggested_at = _LAST_THREAD_SUGGESTION_TURN.get(channel_id, 0)
+    cooldown_met = (last_suggested_at == 0) or (history_length - last_suggested_at >= THREAD_SUGGESTION_COOLDOWN)
+
+    if history_length >= THREAD_SUGGESTION_THRESHOLD and cooldown_met:
+        _LAST_THREAD_SUGGESTION_TURN[channel_id] = history_length
+        
+        approved = await confirm_with_reaction(
+            message,
+            "🧵 This conversation is getting a bit long. Would you like to move this topic to a new thread?"
+        )
+        
+        if approved:
+            try:
+                thread_name = f"Topic Discussion - {datetime.now(BOT_TIMEZONE).strftime('%H:%M')}"
+                new_thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+
+                # Seed the new thread's persistent log with the recent exchange so
+                # the bot still has context once the conversation continues there —
+                # without this, get_channel_history(new_thread) starts empty and the
+                # whole point of moving a long conversation over is lost.
+                recent = list(get_channel_history(message.channel))[-THREAD_SEED_MESSAGES:]
+                for turn in recent:
+                    _append_conversation_log(new_thread.id, turn["role"], turn["content"])
+                _HYDRATED_CHANNELS.discard(new_thread.id)  # force a fresh hydrate on first use
+
+                recap = "\n".join(
+                    f"**{'You' if t['role'] == 'user' else 'Amoai'}:** {t['content'][:300]}"
+                    for t in recent
+                )
+                await send_chunked(
+                    new_thread,
+                    f"🧵 Picking up here — here's where we left off:\n\n{recap}\n\n"
+                    "Go ahead with your follow-up questions."
+                )
+            except discord.HTTPException as e:
+                await send_chunked(message.channel, f"⚠️ Failed to create thread: {e}")
+
 # Initialize Bot
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1116,8 +1491,14 @@ async def on_ready():
 async def on_message(message):
     if message.author == bot.user:
         return
-    if ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
-        return
+    if ALLOWED_CHANNEL_ID:
+        in_allowed_channel = message.channel.id == ALLOWED_CHANNEL_ID
+        in_allowed_thread = (
+            isinstance(message.channel, discord.Thread)
+            and message.channel.parent_id == ALLOWED_CHANNEL_ID
+        )
+        if not (in_allowed_channel or in_allowed_thread):
+            return
 
     user_query = message.content
     user_id = str(message.author.id)
@@ -1200,11 +1581,7 @@ async def on_message(message):
             )
         return
 
-    known_facts = get_user_facts(user_id)
-    facts_block = (
-        "\n\nWhat you remember about this user:\n" + "\n".join(f"- {f}" for f in known_facts)
-        if known_facts else ""
-    )
+    facts_block = await get_relevant_facts_block(user_id, user_query)
 
     system_prompt = (
         "Your name is Amoai. Your nickname is Ai. Your name is based on 'Almond Eye' the legendary racehorse and the Uma Musume. "
@@ -1216,22 +1593,30 @@ async def on_message(message):
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
         "\n\nMEMORY & NOTE-TAKING ROUTING — you have four separate places information can go, and "
-        "picking the wrong one is the single most common mistake, so match the literal trigger words "
-        "below instead of guessing:\n"
-        "• A specific future time, delay, or arrival event ('remind me', 'in 30 minutes', 'at 9pm "
+        "picking the wrong one is the single most common mistake. Several of these share the same "
+        "trigger words (especially 'remember' and 'note'), so check the rules IN ORDER below and stop "
+        "at the first one that matches — don't keyword-match in isolation:\n"
+        "1. A first-person statement about the user's own identity, preferences, job, or routines "
+        "('I use Arch btw', 'remember I'm vegetarian', 'FYI I work remote now') where nothing specific "
+        "is being asked to be saved verbatim and no file is named → call NO tool at all. This is "
+        "captured automatically in the background after your response, even when the message starts "
+        "with the word 'remember'. This rule wins over rules 3 and 5 below whenever it applies, even "
+        "though those also list 'remember' as a trigger word.\n"
+        "2. A specific future time, delay, or arrival event ('remind me', 'in 30 minutes', 'at 9pm "
         "tonight', 'when I get home') → set_reminder.\n"
-        "• 'jot this down', 'add to scratchpad', 'quick note', or 'remember this for later: <thing>' "
-        "with NO time attached and NO existing file involved → jot_down.\n"
-        "• The word 'notes' in any form ('my notes', 'search my notes', 'based on my notes') → "
-        "search_knowledge. 'notes' always means the indexed knowledge base, never the scratchpad, "
-        "even if something related was jotted down earlier in this conversation.\n"
-        "• 'index this file/folder', 'add this doc to memory', 'learn this PDF' → "
-        "index_knowledge_base.\n"
-        "• A durable personal fact about the user themselves (their name, job, preferences, ongoing "
-        "projects) is captured automatically in the background after every message — this happens on "
-        "its own, so don't call jot_down or set_reminder just to record a fact about the user.\n"
-        "When a request could plausibly match two of these, go with whichever trigger words above are "
-        "the closest literal match; only ask the user to confirm if it's genuinely ambiguous.\n\n"
+        "3. 'jot this down', 'add to scratchpad', 'quick note', or a bare 'remember this: <thing>' "
+        "where <thing> is a specific piece of content to save verbatim (a password, a link, a to-do "
+        "item) — NOT a fact about the user themselves (that's rule 1) and NOT time-based (that's rule "
+        "2) → jot_down.\n"
+        "4. The word 'notes' used as a NOUN ('my notes', 'search my notes', 'based on my notes') → "
+        "search_knowledge — the indexed knowledge base, never the scratchpad, even if something "
+        "related was jotted down earlier in this conversation. 'Note' used as a VERB ('note that X', "
+        "'make a note of X') is NOT this — re-check rule 1 and rule 3 instead.\n"
+        "5. The user names an actual file or folder to ingest ('index this file/folder', 'add "
+        "~/notes/project.md to memory', 'learn this PDF') → index_knowledge_base. Never call this just "
+        "because the message contains the word 'remember' with no file or folder actually named.\n"
+        "If you've checked all five in order and it's still genuinely ambiguous, ask the user to "
+        "confirm rather than guessing.\n\n"
         "For set_reminder specifically: prefer minutes_from_now for anything relative ('in 20 minutes') "
         "instead of computing an absolute time yourself — date/time arithmetic is easy to get wrong. "
         "For an explicit date/time, build target_time_iso from the 'Current date and time' below, and "
@@ -1261,7 +1646,7 @@ async def on_message(message):
 
     messages = [
         {"role": "system", "content": system_prompt},
-        *CHANNEL_HISTORY[message.channel.id],
+        *get_channel_history(message.channel),
         current_user_message
     ]
 
@@ -1336,8 +1721,8 @@ async def on_message(message):
                 else:
                     response_text = message_data.get("content", "I processed that, but had nothing to say.")
                     await send_chunked(message.channel, response_text)
-                    CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
-                    CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": response_text})
+                    record_turn(message.channel, user_query, response_text)
+                    asyncio.create_task(maybe_suggest_thread(message, len(get_channel_history(message.channel))))
                     asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
                     running = False
 
@@ -1355,8 +1740,8 @@ async def on_message(message):
                 except Exception:
                     summary_text = "⚠️ I tried processing that request but hit my execution limit. Let's try something else!"
                 await send_chunked(message.channel, summary_text)
-                CHANNEL_HISTORY[message.channel.id].append({"role": "user", "content": user_query})
-                CHANNEL_HISTORY[message.channel.id].append({"role": "assistant", "content": summary_text})
+                record_turn(message.channel, user_query, summary_text)
+                asyncio.create_task(maybe_suggest_thread(message, len(get_channel_history(message.channel))))
                 asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
 
     except asyncio.CancelledError:

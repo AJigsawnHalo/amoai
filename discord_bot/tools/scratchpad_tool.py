@@ -29,9 +29,19 @@ with no time attached is the only case where "remember" means jot_down.
 --- Boundary with the bot's own background memory ---
 Durable facts about the user themselves (name, job, preferences, ongoing
 routines) are captured automatically by a separate process after every
-message. Don't call jot_down to record a fact about the user — it's for
-freeform content the user explicitly wants jotted down verbatim, not
-personal facts the bot infers about them.
+message — this needs NO tool call at all, and applies even when the
+message literally starts with the word "remember". Don't call jot_down to
+record a fact about the user; jot_down is for freeform content the user
+wants saved verbatim (a password, a link, a to-do item), not personal facts
+about who they are or what they like.
+
+Contrast, since both can start with "remember" and only one is jot_down:
+    "remember I use Arch btw"            -> fact about the user -> NO tool
+    "remember this: server IP is 10.0.0.5" -> content to save    -> jot_down
+    "remember to submit the report at 5pm" -> has a time attached -> set_reminder
+If a message is a first-person statement about the user's own identity,
+preferences, or routines, and isn't asking you to save a specific piece of
+text, don't call jot_down for it — let the background process handle it.
 
 Public tool functions (auto-discovered by bot.py's register_tools()):
     - jot_down(content, tag)

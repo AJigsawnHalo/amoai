@@ -206,8 +206,16 @@ def index_knowledge_base(path: str) -> str:
     Pass a single file path or a directory path — directories are scanned
     recursively for supported files. Re-indexing a file only re-embeds
     chunks that actually changed. Only paths inside the configured base
-    directory can be indexed. Use this whenever the user asks to
-    remember, learn, ingest, index, or add a document/folder/notes to memory.
+    directory can be indexed.
+
+    Use this ONLY when the user names an actual file or folder to ingest
+    ("index this file/folder", "add ~/notes/project.md to memory", "learn
+    this PDF"). A bare "remember <fact>" with NO file or folder named is
+    NEVER this tool, even though "remember" sounds similar — that's either
+    jot_down in scratchpad_tool.py (content to save verbatim) or nothing at
+    all (a fact about the user themselves is captured automatically in the
+    background). If the message doesn't reference a concrete path, don't
+    reach for this tool no matter which of those other two words it uses.
     """
     target = Path(path).expanduser()
     if not target.exists():
@@ -298,11 +306,17 @@ def search_knowledge(query: str, top_k: int = 5) -> str:
     Searches the indexed knowledge base (markdown notes, code snippets, PDFs)
     for passages most relevant to the query and returns them with their
     source file. This is the canonical tool for "based on my notes" and
-    "search my notes" — the word "notes" in this bot ALWAYS refers to this
-    indexed knowledge base, never scratchpad_tool.py's entries, even if the
-    user jotted something down earlier in the same conversation. Use this
-    whenever the user asks to recall, find, look up, search, or reference
-    something from previously indexed notes, docs, or code.
+    "search my notes" — "notes" used as a NOUN (my notes, search my notes,
+    what do my notes say) ALWAYS refers to this indexed knowledge base,
+    never scratchpad_tool.py's entries, even if the user jotted something
+    down earlier in the same conversation.
+
+    "Notes" used as a VERB ("note that X", "make a note of X") is NOT this
+    tool — that's jot_down in scratchpad_tool.py instead, saving X verbatim
+    rather than searching anything. Use search_knowledge whenever the user
+    asks to recall, find, look up, search, or reference something from
+    previously indexed notes, docs, or code — never just because the word
+    "note" appears somewhere in the message.
     """
     conn = _get_conn()
     rows = conn.execute("SELECT source, chunk_index, content, embedding FROM chunks").fetchall()
