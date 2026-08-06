@@ -1,0 +1,23 @@
+# Normalize text files to LF regardless of a contributor's local
+# core.autocrlf setting — prevents CRLF/LF mismatches that make `git apply`
+# reject otherwise-correct patches.
+* text=auto eol=lf
+
+*.py  text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.sh  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.env.example text eol=lf
+
+# Binary/compiled files — leave untouched, never text-diff or convert these.
+*.pyc binary
+*.sqlite3 binary
+*.db binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
