@@ -1617,6 +1617,17 @@ async def on_ready():
     await start_webhook_server()
     await embed_all_tools()
 
+    # Wire job_manager to this process's event loop and a way to post
+    # results back to Discord when a background job finishes on its own.
+    from tools.job_manager import set_event_loop, set_notifier
+    set_event_loop(asyncio.get_event_loop())
+    if ALLOWED_CHANNEL_ID:
+        async def _notify_job_channel(text: str):
+            channel = bot.get_channel(ALLOWED_CHANNEL_ID)
+            if channel:
+                await send_chunked(channel, text)
+        set_notifier(_notify_job_channel)
+
     # Only announce once per process start — on_ready can fire again on reconnects
     if not _startup_notified:
         _startup_notified = True
