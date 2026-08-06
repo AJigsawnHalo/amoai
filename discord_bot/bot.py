@@ -515,11 +515,24 @@ MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 LEGACY_MEMORY_FILE = Path(__file__).resolve().parent / "memory_store.json"
 MAX_FACTS_PER_USER = 200  # was 40 on the old JSON store
 
-# Two facts whose embeddings score at or above this are treated as the same
-# fact and never stored twice — catches near-duplicate phrasing ("likes
-# coffee" vs "really likes coffee in the morning") that the exact-string
-# UNIQUE constraint alone would miss.
+# Two facts whose embeddings score at or above this are close enough to be
+# treated as verbatim the same and skipped outright — no need to even ask
+# about it. In practice most real near-duplicates ("likes coffee" vs "really
+# likes coffee in the morning") land a bit below this, which is why there's
+# a second, lower band below for those.
 FACT_DEDUP_THRESHOLD = 0.93
+# Two facts whose embeddings score in [FACT_SUPERSESSION_BAND_MIN,
+# FACT_DEDUP_THRESHOLD) are similar enough that they're probably about the
+# same underlying thing but not similar enough to safely auto-skip — that's
+# exactly the "slightly different phrasing" case that was slipping through
+# before. Rather than trust the original broad extraction call to have
+# already caught this (it often doesn't, especially on smaller models), a
+# candidate in this band gets one focused, single-pair LLM comparison before
+# being stored — see _find_supersession_candidate / _llm_decides_replace.
+# Start conservative; if it's still merging facts that were actually meant
+# to coexist, raise this number, and if near-duplicates keep slipping
+# through as separate entries, lower it.
+FACT_SUPERSESSION_BAND_MIN = 0.78
 # Fact lists at or under this size are injected into the system prompt
 # whole — not worth the embedding/ranking overhead. Above it, only the
 # FACT_RELEVANCE_TOP_K most relevant facts to the current message go in, so
@@ -778,6 +791,61 @@ def _is_semantic_duplicate(
             return True
     return False
 
+def _find_supersession_candidate(
+    embedding: "tuple[str, list[float]] | None", existing: list
+) -> "tuple[str, float] | None":
+    """Finds the existing fact most similar to `embedding`, if its score
+    falls in [FACT_SUPERSESSION_BAND_MIN, FACT_DEDUP_THRESHOLD) — similar
+    enough to plausibly be the same underlying fact restated, but not so
+    similar that _is_semantic_duplicate already caught it. Returns
+    (existing_fact_text, score) or None. Same-space-only, same reasoning as
+    _is_semantic_duplicate."""
+    if not embedding:
+        return None
+    space, vector = embedding
+    best = None
+    for fact_text, existing_embedding in existing:
+        if not existing_embedding:
+            continue
+        existing_space, existing_vector = existing_embedding
+        if existing_space != space:
+            continue
+        score = cosine_similarity(vector, existing_vector)
+        if FACT_SUPERSESSION_BAND_MIN <= score < FACT_DEDUP_THRESHOLD:
+            if best is None or score > best[1]:
+                best = (fact_text, score)
+    return best
+
+async def _llm_decides_replace(existing_fact: str, new_fact: str) -> bool:
+    """Focused single-pair comparison — deliberately a much narrower ask than
+    the original extraction prompt (which has to scan the whole fact list
+    and produce structured JSON in one pass, and in practice often misses
+    this). A yes/no call on exactly two sentences is a task small/local
+    models handle far more reliably. Defaults to False (keep both as
+    separate facts) if the call fails or comes back unparseable — the worse
+    outcome from a false negative here is one extra stored fact, which is
+    far less damaging than wrongly erasing one the user still meant."""
+    prompt = (
+        "Two statements about the same person, from different times:\n"
+        f"Earlier: {existing_fact}\n"
+        f"Just now: {new_fact}\n\n"
+        "Should \"Just now\" REPLACE \"Earlier\" (same underlying fact — a "
+        "preference changed, a detail got more specific, a status changed)? "
+        "Or are they two separate facts that can both stay true at the same "
+        "time (e.g. two different hobbies, two different routines)?\n"
+        "Reply with exactly one word: REPLACE or SEPARATE."
+    )
+    try:
+        response = await query_llm(
+            {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "stream": False},
+            timeout=20,
+        )
+        verdict = response.get("message", {}).get("content", "").strip().upper()
+        return verdict.startswith("REPLACE")
+    except Exception as e:
+        print(f"[MEMORY] Supersession check skipped (non-fatal): {e}")
+        return False
+
 def remove_user_fact(user_id: str, identifier: str):
     conn = _get_memory_conn()
     try:
@@ -814,6 +882,62 @@ def remove_user_fact(user_id: str, identifier: str):
         conn.execute("DELETE FROM facts WHERE id = ?", (target_id,))
         conn.commit()
         return target_fact
+    finally:
+        conn.close()
+
+def _parse_fact_indices(spec: str) -> "list[int] | None":
+    """Parses a comma/space-separated list of 1-based !recall positions and
+    ranges ('1,3,5', '1 3 5', '2-4', or any mix) into a sorted, de-duplicated
+    list of ints. Returns None if `spec` doesn't look like an index list at
+    all, so the caller can fall back to single-fact text matching — this
+    keeps plain '!forget <text>' working exactly as before."""
+    spec = spec.strip()
+    if not spec:
+        return None
+    tokens = [t for t in re.split(r"[,\s]+", spec) if t]
+    if not tokens:
+        return None
+    indices = set()
+    for tok in tokens:
+        if tok.isdigit():
+            indices.add(int(tok))
+        elif re.fullmatch(r"\d+-\d+", tok):
+            a, b = (int(x) for x in tok.split("-"))
+            if a > b:
+                a, b = b, a
+            indices.update(range(a, b + 1))
+        else:
+            return None  # contains something that isn't a number or range
+    return sorted(i for i in indices if i > 0) or None
+
+def remove_user_facts(user_id: str, indices: list) -> tuple:
+    """Removes multiple facts at once by their 1-based !recall position.
+    All positions are resolved against a single snapshot of the current
+    list before anything is deleted, so removing e.g. both 1 and 3 in the
+    same call is safe — an earlier deletion never shifts what a later index
+    refers to. Returns (removed_texts, invalid_positions); invalid_positions
+    covers anything out of range so the caller can report it back."""
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, fact FROM facts WHERE user_id = ? ORDER BY id ASC",
+            (str(user_id),),
+        ).fetchall()
+
+        removed_texts, invalid, to_delete_ids = [], [], []
+        for idx in indices:
+            pos = idx - 1
+            if 0 <= pos < len(rows):
+                row_id, fact = rows[pos]
+                to_delete_ids.append(row_id)
+                removed_texts.append(fact)
+            else:
+                invalid.append(idx)
+
+        if to_delete_ids:
+            conn.executemany("DELETE FROM facts WHERE id = ?", [(i,) for i in to_delete_ids])
+            conn.commit()
+        return removed_texts, invalid
     finally:
         conn.close()
 
@@ -925,6 +1049,20 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
             embedding = await _embed_fact(fact)
             if _is_semantic_duplicate(embedding, existing_for_dedup):
                 continue
+
+            candidate = _find_supersession_candidate(embedding, existing_for_dedup)
+            if candidate is not None:
+                old_text, _score = candidate
+                if await _llm_decides_replace(old_text, fact):
+                    result = update_user_fact(user_id, old_text, fact, embedding)
+                    if result:
+                        updated_summaries.append(f"{result[0]} → {result[1]}")
+                        existing_for_dedup = [
+                            (f, e) for f, e in existing_for_dedup if f != old_text
+                        ]
+                        existing_for_dedup.append((fact, embedding))
+                    continue
+
             if add_user_fact(user_id, fact, embedding):
                 added.append(fact)
                 existing_for_dedup.append((fact, embedding))
@@ -1559,7 +1697,8 @@ async def on_message(message):
             text = "Here's what I remember about you:\n" + "\n".join(
                 f"{i}. {f}" for i, f in enumerate(known_facts, start=1)
             )
-            text += "\n\nUse `!forget <number>` to remove one, or `!forget` to clear everything."
+            text += "\n\nUse `!forget <number>` to remove one (e.g. `!forget 1,3,5` or `!forget 2-4` " \
+                    "for several at once), or `!forget` on its own to clear everything."
         else:
             text = "I don't have anything saved about you yet."
         await send_chunked(message.channel, text)
@@ -1570,15 +1709,31 @@ async def on_message(message):
         return
     if trigger.startswith("!forget "):
         identifier = user_query.strip()[len("!forget "):].strip()
-        removed = remove_user_fact(user_id, identifier)
-        if removed:
-            await send_chunked(message.channel, f"🗑️ Forgot: {removed}")
+        indices = _parse_fact_indices(identifier)
+        if indices is not None:
+            removed_texts, invalid = remove_user_facts(user_id, indices)
+            parts = []
+            if removed_texts:
+                parts.append("🗑️ Forgot:\n" + "\n".join(f"- {f}" for f in removed_texts))
+            if invalid:
+                parts.append(f"⚠️ Nothing at position(s): {', '.join(str(i) for i in invalid)}")
+            if not parts:
+                parts.append(
+                    "I couldn't find any matching facts to remove. Try `!recall` for the "
+                    "numbered list, then `!forget <number>` (or `!forget 1,3,5` / `!forget 2-4` "
+                    "for several at once)."
+                )
+            await send_chunked(message.channel, "\n\n".join(parts))
         else:
-            await send_chunked(
-                message.channel,
-                "I couldn't find a matching fact to remove. Try `!recall` for the numbered list, "
-                "then `!forget <number>`."
-            )
+            removed = remove_user_fact(user_id, identifier)
+            if removed:
+                await send_chunked(message.channel, f"🗑️ Forgot: {removed}")
+            else:
+                await send_chunked(
+                    message.channel,
+                    "I couldn't find a matching fact to remove. Try `!recall` for the numbered list, "
+                    "then `!forget <number>` (or `!forget 1,3,5` / `!forget 2-4` for several at once)."
+                )
         return
 
     facts_block = await get_relevant_facts_block(user_id, user_query)
@@ -1622,7 +1777,8 @@ async def on_message(message):
         "For an explicit date/time, build target_time_iso from the 'Current date and time' below, and "
         "never guess the year if the user didn't give one.\n\n"
         "If the user asks what you remember, or how to clear it, tell them they can type "
-        "!recall to see a numbered list of saved facts, !forget <number> to remove just one, "
+        "!recall to see a numbered list of saved facts, !forget <number> to remove just one "
+        "(!forget 1,3,5 or !forget 2-4 to remove several at once), "
         "or !forget on its own to clear everything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
