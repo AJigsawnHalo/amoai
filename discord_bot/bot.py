@@ -1166,8 +1166,17 @@ register_job("Reminder Alert", 60, check_scheduled_reminders)
 MORNING_BRIEFING_HOUR = int(os.getenv("MORNING_BRIEFING_HOUR", 6))
 _last_briefing_date = None
 
+# Runtime on/off switch. Seeded from .env so it survives as the default
+# across restarts, but toggleable live via !briefing on/off without editing
+# .env or restarting the bot (see the !briefing command handler below).
+MORNING_BRIEFING_ENABLED = os.getenv("MORNING_BRIEFING_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no", "off"
+)
+
 async def check_morning_briefing() -> str | None:
     global _last_briefing_date
+    if not MORNING_BRIEFING_ENABLED:
+        return None
     now = datetime.now(BOT_TIMEZONE)
     if now.hour < MORNING_BRIEFING_HOUR:
         return None
@@ -1700,6 +1709,19 @@ async def on_message(message):
             await send_chunked(message.channel, "🛑 Stopping...")
         else:
             await send_chunked(message.channel, "Nothing's running right now.")
+        return
+
+    if trigger in ("!briefing on", "!briefing off", "!briefing status"):
+        global MORNING_BRIEFING_ENABLED
+        if trigger == "!briefing on":
+            MORNING_BRIEFING_ENABLED = True
+            await send_chunked(message.channel, "☀️ Morning briefing is now **on**.")
+        elif trigger == "!briefing off":
+            MORNING_BRIEFING_ENABLED = False
+            await send_chunked(message.channel, "🔕 Morning briefing is now **off**.")
+        else:
+            state = "on" if MORNING_BRIEFING_ENABLED else "off"
+            await send_chunked(message.channel, f"Morning briefing is currently **{state}**.")
         return
 
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
