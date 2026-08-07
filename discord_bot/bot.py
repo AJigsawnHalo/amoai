@@ -296,6 +296,50 @@ def map_python_type_to_json(py_type):
     mapping = {str: "string", int: "number", float: "number", bool: "boolean"}
     return mapping.get(py_type, "string")
 
+# Matches a ":param name: description text" line, capturing the name and
+# the description. The description can wrap onto following indented lines
+# (anything not starting a new ":param"/":return" tag), which is how the
+# tool docstrings in tools/ are written for longer explanations.
+_PARAM_LINE_RE = re.compile(r"^\s*:param\s+(\w+):\s?(.*)$")
+
+def _parse_docstring(doc: str) -> tuple[str, dict[str, str]]:
+    """Splits a Google/Sphinx-style tool docstring into (summary, params).
+
+    summary is everything before the first ':param' line, dedented and
+    stripped — this becomes the tool-level description. params maps each
+    documented parameter name to its description text, so it can be
+    attached to that parameter's own schema entry instead of being left
+    buried inside one big blob of text the model has to parse itself out
+    of prose.
+    """
+    if not doc:
+        return "No description", {}
+
+    lines = doc.splitlines()
+    summary_lines = []
+    params: dict[str, str] = {}
+    current_param = None
+
+    for line in lines:
+        match = _PARAM_LINE_RE.match(line)
+        if match:
+            current_param = match.group(1)
+            params[current_param] = match.group(2).strip()
+        elif current_param is not None:
+            # Continuation of the previous :param's description, unless
+            # this line is blank (end of the docstring's tag block) or
+            # looks like a new tag (":return:", ":raises:", etc.).
+            stripped = line.strip()
+            if not stripped or stripped.startswith(":"):
+                current_param = None
+            else:
+                params[current_param] += " " + stripped
+        else:
+            summary_lines.append(line)
+
+    summary = "\n".join(summary_lines).strip()
+    return (summary or "No description"), params
+
 def register_tools():
     print("[SYSTEM] Discovering tools...")
     for _, module_name, _ in pkgutil.iter_modules(tools.__path__):
@@ -305,7 +349,8 @@ def register_tools():
             if callable(func) and not inspect.isclass(func) and not attr_name.startswith('_') and getattr(func, '__module__', None) == f"tools.{module_name}":
                 sig = inspect.signature(func)
                 params = sig.parameters
-                
+                summary, param_docs = _parse_docstring(func.__doc__)
+
                 parameters = {
                     "type": "object",
                     "properties": {},
@@ -314,7 +359,10 @@ def register_tools():
                 for name, param in params.items():
                     if name == "user_id":
                         continue
-                    parameters["properties"][name] = {"type": map_python_type_to_json(param.annotation)}
+                    prop = {"type": map_python_type_to_json(param.annotation)}
+                    if name in param_docs:
+                        prop["description"] = param_docs[name]
+                    parameters["properties"][name] = prop
                     if param.default == inspect.Parameter.empty:
                         parameters["required"].append(name)
                 
@@ -322,7 +370,7 @@ def register_tools():
                     "type": "function",
                     "function": {
                         "name": func.__name__,
-                        "description": func.__doc__ or "No description",
+                        "description": summary,
                         "parameters": parameters
                     }
                 }
