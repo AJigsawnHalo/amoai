@@ -1,4 +1,15 @@
+import os
 import subprocess
+
+# Fail-closed: nothing is restartable until explicitly allowed. Set
+# ALLOWED_RESTART_SERVICES in .env as a comma-separated list of exact
+# systemd unit names, e.g. "jellyfin,transmission". Empty/unset means
+# restart_service refuses everything — this runs with sudo, so a
+# hallucinated or manipulated service_name must not be able to hit
+# something like networking/ssh/systemd-resolved.
+_ALLOWED_SERVICES = {
+    s.strip() for s in os.getenv("ALLOWED_RESTART_SERVICES", "").split(",") if s.strip()
+}
 
 def get_top_processes(n=5) -> str:
     """Lists the top N processes consuming CPU/RAM."""
@@ -10,8 +21,11 @@ def get_top_processes(n=5) -> str:
 
     # Standard ps command to grab processes
     cmd = ["ps", "aux", "--sort=-%cpu"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return "❌ Timed out reading the process list."
+
     if result.returncode != 0:
         return "Error accessing processes."
     
@@ -22,11 +36,24 @@ def get_top_processes(n=5) -> str:
     return top_processes
 
 def restart_service(service_name: str) -> str:
-    """Restarts a systemd service (Requires configured sudo privilege)."""
+    """Restarts a systemd service (Requires configured sudo privilege).
+    Only services listed in the ALLOWED_RESTART_SERVICES env var can be
+    restarted — see the comment at the top of this file for why."""
+    if service_name not in _ALLOWED_SERVICES:
+        return (
+            f"❌ '{service_name}' isn't on the allowed restart list. Add it to "
+            f"ALLOWED_RESTART_SERVICES in .env (comma-separated exact unit names) "
+            f"if it should be restartable."
+        )
     try:
         # This will fail unless the user running the script has passwordless sudo setup
-        subprocess.run(["sudo", "systemctl", "restart", service_name], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["sudo", "systemctl", "restart", service_name],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
         return f"Successfully restarted {service_name}."
+    except subprocess.TimeoutExpired:
+        return f"❌ Restarting {service_name} timed out after 30s."
     except subprocess.CalledProcessError as e:
         # Capture stderr to explain exactly why it failed (e.g., "interactive password required")
         error_msg = e.stderr.strip() if e.stderr else str(e)

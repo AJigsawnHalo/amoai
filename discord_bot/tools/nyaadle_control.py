@@ -1,10 +1,14 @@
+import os
 import re
 import subprocess
 from pathlib import Path
 
-# Adjust to wherever the nyaadle binary actually lives, e.g. via `which nyaadle`
-NYAADLE_BIN = "/home/elskiee/.cargo/bin/nyaadle"
-NYAADLE_LOG = Path("~/.config/nyaadle/nyaadle.log").expanduser()
+# Configurable like the rest of the project's paths (see .env.example) —
+# default matches the original hardcoded value, so this is a no-op unless
+# you override it. Still adjust NYAADLE_BIN in .env if `which nyaadle`
+# reports something different on a given machine.
+NYAADLE_BIN = os.getenv("NYAADLE_BIN", "/home/elskiee/.cargo/bin/nyaadle")
+NYAADLE_LOG = Path(os.getenv("NYAADLE_LOG", "~/.config/nyaadle/nyaadle.log")).expanduser()
 
 # Matches lines like:
 # 2026-Jul-14 Tue 04:36:26 [INFO] Downloaded [ASW] Otome Kaijuu Carameliser - 02 [1080p HEVC x265 10Bit][AAC]
