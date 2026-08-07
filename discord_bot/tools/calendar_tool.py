@@ -22,6 +22,10 @@ available on the connected Google account.
 
 Public tool functions (auto-discovered by bot.py's register_tools()):
     - list_calendar_events(days_ahead, calendar_id)
+        Defaults to checking EVERY calendar on the account. Pass "primary"
+        for just the main one, or a comma-separated list of calendar IDs
+        for a specific set. Override the default via the
+        GOOGLE_CALENDAR_LIST_DEFAULT env var.
     - create_calendar_event(summary, start_time_iso, end_time_iso, description, location, all_day, calendar_id)
     - delete_calendar_event(identifier, days_ahead, calendar_id)
     - list_calendars()
@@ -49,6 +53,11 @@ _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CREDENTIALS_FILE = Path(os.getenv("GOOGLE_CALENDAR_CREDENTIALS_FILE", _DATA_DIR / "google_calendar_credentials.json"))
 TOKEN_FILE = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_FILE", _DATA_DIR / "google_calendar_token.json"))
 DEFAULT_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+# Separate default just for listing/reading — checking "what's on my
+# calendar" should reasonably mean every calendar by default, unlike
+# create/delete which should always target one specific calendar. Set
+# GOOGLE_CALENDAR_LIST_DEFAULT=primary (or a specific id/list) to opt out.
+DEFAULT_LIST_CALENDARS = os.getenv("GOOGLE_CALENDAR_LIST_DEFAULT", "all")
 
 _SETUP_HINT = (
     "Run `python setup_google_calendar_auth.py` once (see the top of "
@@ -109,50 +118,109 @@ def _format_dt(dt_str: str, all_day: bool) -> str:
 # PUBLIC TOOLS (discovered + exposed to the LLM by bot.py)
 # ============================================================
 
+def _resolve_calendar_targets(service, calendar_id: str) -> list[tuple[str, str]]:
+    """
+    Turns a calendar_id argument into a list of (id, label) pairs to query.
+
+      - None / falsy         -> DEFAULT_LIST_CALENDARS (all calendars, unless overridden)
+      - "all"                -> every calendar on the account
+      - "id1,id2,..."        -> exactly those calendars
+      - a single plain id    -> just that one calendar
+
+    Labels are looked up from calendarList when more than one calendar is
+    being queried, so results can say which calendar each event came from;
+    for the single-calendar case no lookup is needed.
+    """
+    if not calendar_id:
+        calendar_id = DEFAULT_LIST_CALENDARS
+
+    requested = [c.strip() for c in calendar_id.split(",") if c.strip()]
+    wants_all = len(requested) == 1 and requested[0].lower() == "all"
+
+    if not wants_all and len(requested) <= 1:
+        return [(calendar_id, "")]
+
+    # Multiple calendars (either explicit list or "all") — fetch names so
+    # events can be labeled with which calendar they belong to.
+    try:
+        cal_list = service.calendarList().list().execute().get("items", [])
+    except HttpError:
+        cal_list = []
+    name_by_id = {c["id"]: c.get("summary", c["id"]) for c in cal_list}
+
+    if wants_all:
+        ids = list(name_by_id.keys()) or [DEFAULT_CALENDAR_ID]
+    else:
+        ids = requested
+
+    return [(cid, name_by_id.get(cid, cid)) for cid in ids]
+
+
 def list_calendar_events(days_ahead: int = 7, calendar_id: str = None) -> str:
     """
-    Lists upcoming events on the connected Google Calendar over the next N
-    days, soonest first. Use this whenever the user asks what's on their
-    calendar/schedule, whether they're free, or what's coming up.
+    Lists upcoming events over the next N days, soonest first. Use this
+    whenever the user asks what's on their calendar/schedule, whether
+    they're free, or what's coming up.
 
     :param days_ahead: How many days from now to look ahead. Defaults to 7.
-    :param calendar_id: Optional. Which calendar to check — defaults to the primary calendar. Use list_calendars if the user names a specific calendar you're unsure of the ID for.
+    :param calendar_id: Optional. Which calendar(s) to check. Defaults to every calendar on the account; pass a specific calendar ID (or comma-separated list) to narrow it, or "primary" for just the main one. Use list_calendars if the user names a specific calendar you're unsure of the ID for.
     """
-    calendar_id = calendar_id or DEFAULT_CALENDAR_ID
     try:
         service = _get_service()
     except RuntimeError as e:
         return f"❌ {e}"
 
+    targets = _resolve_calendar_targets(service, calendar_id)
+
     now = datetime.now(timezone.utc)
     time_min = now.isoformat()
     time_max = (now + timedelta(days=max(1, days_ahead))).isoformat()
 
-    try:
-        result = service.events().list(
-            calendarId=calendar_id,
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=50,
-        ).execute()
-    except HttpError as e:
-        return f"❌ Google Calendar error: {e}"
+    all_events = []
+    errors = []
+    for cid, label in targets:
+        try:
+            result = service.events().list(
+                calendarId=cid,
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=50,
+            ).execute()
+        except HttpError as e:
+            errors.append(f"{label or cid}: {e}")
+            continue
+        for ev in result.get("items", []):
+            ev["_calendar_label"] = label
+            all_events.append(ev)
 
-    events = result.get("items", [])
-    if not events:
+    if not all_events:
+        if errors and not any(t[1] == "" for t in targets):
+            # every target errored and none was a plain single-calendar call
+            return "❌ Google Calendar error(s): " + "; ".join(errors)
         return f"No events in the next {days_ahead} day(s)."
 
+    def _sort_key(ev):
+        start = ev.get("start", {})
+        return start.get("dateTime") or start.get("date") or ""
+
+    all_events.sort(key=_sort_key)
+
+    multi = len(targets) > 1
     lines = [f"📅 Upcoming events (next {days_ahead} day(s)):\n"]
-    for ev in events:
+    for ev in all_events:
         start = ev.get("start", {})
         all_day = "date" in start
         raw = start.get("date") or start.get("dateTime", "")
         when = _format_dt(raw, all_day)
         title = ev.get("summary", "(no title)")
         loc = f" — {ev['location']}" if ev.get("location") else ""
-        lines.append(f"- **{title}** — {when}{loc}")
+        cal_tag = f" [{ev['_calendar_label']}]" if multi and ev.get("_calendar_label") else ""
+        lines.append(f"- **{title}** — {when}{loc}{cal_tag}")
+
+    if errors:
+        lines.append("\n⚠️ Some calendars couldn't be checked: " + "; ".join(errors))
 
     return "\n".join(lines)
 
