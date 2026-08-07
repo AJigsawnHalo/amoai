@@ -332,6 +332,9 @@ def register_tools():
 
 register_tools()
 
+from tools.job_manager import set_tool_registry
+set_tool_registry(TOOL_REGISTRY)
+
 # --- DYNAMIC TOOL SELECTION (embedding-based) ---
 TOOL_EMBEDDINGS: dict[str, list[float]] = {}
 TOOL_EMBED_CACHE_FILE = Path(__file__).resolve().parent / "tool_embedding_cache.json"
