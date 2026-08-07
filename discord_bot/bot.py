@@ -1681,6 +1681,28 @@ def _get_last_thread_suggestion(channel_id) -> int:
         conn.close()
     return row[0] if row else 0
 
+def _get_conversation_message_count(channel_id) -> int:
+    """True, unbounded count of messages logged for this channel so far.
+
+    Deliberately NOT len(get_channel_history(channel)) — that deque is capped
+    at HISTORY_TURNS*2 / THREAD_HISTORY_TURNS*2 messages, so its len() stops
+    growing once a conversation passes that cap and just sits pinned at the
+    ceiling forever. Used as the cooldown math's input, that plateau makes
+    "history_length - last_suggested_at >= COOLDOWN" permanently unsatisfiable
+    after the first couple of suggestions, silently disabling the whole
+    feature for that channel for good. conversation_log isn't capped until
+    500 messages/channel, comfortably above where this feature operates.
+    """
+    conn = _get_memory_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM conversation_log WHERE channel_id = ?",
+            (str(channel_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else 0
+
 def _set_last_thread_suggestion(channel_id, history_length: int):
     conn = _get_memory_conn()
     try:
@@ -2084,7 +2106,7 @@ async def on_message(message):
                     response_text = message_data.get("content", "I processed that, but had nothing to say.")
                     await send_chunked(message.channel, response_text)
                     record_turn(message.channel, user_query, response_text)
-                    asyncio.create_task(maybe_suggest_thread(message, len(get_channel_history(message.channel))))
+                    asyncio.create_task(maybe_suggest_thread(message, _get_conversation_message_count(message.channel.id)))
                     asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
                     running = False
 
@@ -2103,7 +2125,7 @@ async def on_message(message):
                     summary_text = "⚠️ I tried processing that request but hit my execution limit. Let's try something else!"
                 await send_chunked(message.channel, summary_text)
                 record_turn(message.channel, user_query, summary_text)
-                asyncio.create_task(maybe_suggest_thread(message, len(get_channel_history(message.channel))))
+                asyncio.create_task(maybe_suggest_thread(message, _get_conversation_message_count(message.channel.id)))
                 asyncio.create_task(extract_and_store_facts(user_id, user_query, message.channel))
 
     except asyncio.CancelledError:
