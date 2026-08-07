@@ -1507,6 +1507,48 @@ def _extract_zip_text(data: bytes, filename: str) -> str:
     return combined
 
 
+MAX_REPLY_CONTEXT_CHARS = 4000  # guard against quoting a huge message wholesale
+
+
+async def get_reply_context(message: "discord.Message") -> str:
+    """If this message is a Discord reply, resolve the message being replied
+    to and format it as a context block, the same way attachments/images get
+    folded into user_query below. Returns "" if this isn't a reply, or the
+    original message can't be resolved (e.g. it was deleted).
+
+    discord.py usually populates message.reference.resolved from its cache,
+    but that's not guaranteed (e.g. after a restart, or a reply to something
+    outside the cache window) — falls back to fetch_message when it's missing
+    or came back as a DeletedReferencedMessage stub.
+    """
+    ref = message.reference
+    if ref is None:
+        return ""
+
+    resolved = ref.resolved
+    if resolved is None or isinstance(resolved, discord.DeletedReferencedMessage):
+        if ref.message_id is None:
+            return ""
+        try:
+            resolved = await message.channel.fetch_message(ref.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return ""
+
+    author_label = "you (Amoai), earlier" if resolved.author.id == bot.user.id else f"{resolved.author.display_name}"
+    content = (resolved.content or "").strip()
+    if not content and resolved.attachments:
+        content = f"[message had no text, just attachment(s): {', '.join(a.filename for a in resolved.attachments)}]"
+    if not content and resolved.embeds:
+        content = "[message had no text, just an embed]"
+    if not content:
+        return ""
+
+    if len(content) > MAX_REPLY_CONTEXT_CHARS:
+        content = content[:MAX_REPLY_CONTEXT_CHARS] + "\n[...truncated]"
+
+    return f"[Replied-to message — from {author_label}]\n{content}\n"
+
+
 async def process_image_attachments(attachments: "list[discord.Attachment]") -> "tuple[list[str], list[str]]":
     """Downloads image attachments and base64-encodes them for the Ollama
     'images' field. Returns (base64_images, notes) — notes are skip/error
@@ -1747,6 +1789,14 @@ async def on_message(message):
     user_query = message.content
     user_id = str(message.author.id)
 
+    # --- REPLY CONTEXT: if this message is a Discord reply, pull in the
+    # message being replied to so the model has it even if it's long since
+    # scrolled out of the rolling channel history. ---
+    reply_context = await get_reply_context(message)
+    has_reply_context = bool(reply_context)
+    if reply_context:
+        user_query = f"{reply_context}\n{user_query}" if user_query else reply_context
+
     # --- ATTACHMENTS: images go to vision, everything else gets read as text ---
     pending_images_b64 = []
     file_context = ""
@@ -1944,6 +1994,11 @@ async def on_message(message):
            "has been inlined below under '[Attached file contents below]'. Treat that as "
            "read, not something you need a tool to fetch."
            if file_context else "")
+        + ("\n\nThe user used Discord's reply feature to reply directly to an earlier message, "
+           "which is inlined below under '[Replied-to message]'. Treat that message as the "
+           "specific thing they're asking about/reacting to — it's the context they intended "
+           "to give you, even if it's not otherwise related to the current topic."
+           if has_reply_context else "")
         + facts_block
     )
 
