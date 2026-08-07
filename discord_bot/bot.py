@@ -588,6 +588,14 @@ def _get_memory_conn() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_convlog_channel ON conversation_log(channel_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thread_suggestion_state (
+            channel_id TEXT PRIMARY KEY,
+            last_suggested_at INTEGER NOT NULL
+        )
+        """
+    )
     # Additive migration for DBs created before updated_at/embedding existed.
     # ADD COLUMN has no "IF NOT EXISTS" in SQLite, so this just no-ops with
     # an OperationalError ("duplicate column") on every run after the first.
@@ -1563,10 +1571,37 @@ async def process_file_attachments(attachments: "list[discord.Attachment]") -> "
 
 
 # --- AUTOMATIC THREAD SUGGESTION ---
-_LAST_THREAD_SUGGESTION_TURN: dict[int, int] = {}
+# Persisted in SQLite (thread_suggestion_state), not just kept in memory —
+# history_length is hydrated from the persistent conversation_log on restart,
+# so an in-memory-only cooldown tracker would reset to "never suggested" on
+# every restart while history_length stays wherever it left off, causing an
+# immediate re-suggestion on the first message after every restart.
 THREAD_SUGGESTION_THRESHOLD = 6   # messages in history before suggesting
 THREAD_SUGGESTION_COOLDOWN = 10   # messages before asking again after a decline/timeout
 THREAD_SEED_MESSAGES = 6          # most recent messages copied into the new thread for continuity
+
+def _get_last_thread_suggestion(channel_id) -> int:
+    conn = _get_memory_conn()
+    try:
+        row = conn.execute(
+            "SELECT last_suggested_at FROM thread_suggestion_state WHERE channel_id = ?",
+            (str(channel_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else 0
+
+def _set_last_thread_suggestion(channel_id, history_length: int):
+    conn = _get_memory_conn()
+    try:
+        conn.execute(
+            "INSERT INTO thread_suggestion_state (channel_id, last_suggested_at) VALUES (?, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET last_suggested_at = excluded.last_suggested_at",
+            (str(channel_id), history_length),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 async def maybe_suggest_thread(message, history_length: int):
     """Checks if the conversation is getting long and offers to spin up a thread,
@@ -1576,11 +1611,11 @@ async def maybe_suggest_thread(message, history_length: int):
     if isinstance(message.channel, discord.Thread):
         return
 
-    last_suggested_at = _LAST_THREAD_SUGGESTION_TURN.get(channel_id, 0)
+    last_suggested_at = _get_last_thread_suggestion(channel_id)
     cooldown_met = (last_suggested_at == 0) or (history_length - last_suggested_at >= THREAD_SUGGESTION_COOLDOWN)
 
     if history_length >= THREAD_SUGGESTION_THRESHOLD and cooldown_met:
-        _LAST_THREAD_SUGGESTION_TURN[channel_id] = history_length
+        _set_last_thread_suggestion(channel_id, history_length)
         
         approved = await confirm_with_reaction(
             message,
