@@ -198,7 +198,7 @@ async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
         return result
 
 # --- CONFIRMATION-GATED TOOLS ---
-CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "nyaadle_check_now", "move_file", "delete_file", "delete_calendar_event", "clear_failure_logs"}
+CONFIRMATION_REQUIRED_TOOLS = {"restart_service", "restart_container", "nyaadle_check_now", "move_file", "delete_file", "delete_calendar_event", "clear_failure_logs"}
 OVERWRITE_GATED_TOOLS = {"write_file", "copy_file", "move_file"}
 
 def needs_confirmation(name: str, args: dict) -> bool:
@@ -1808,6 +1808,38 @@ async def on_message(message):
         else:
             state = "on" if MORNING_BRIEFING_ENABLED else "off"
             await send_chunked(message.channel, f"Morning briefing is currently **{state}**.")
+        return
+
+    if trigger == "!allowlist" or trigger.startswith("!allowlist "):
+        # Owner-only: this gates a security control (which Docker containers
+        # the LLM's restart_container tool may touch), so it's checked here
+        # rather than relying on channel membership like the other ! commands.
+        if user_id != DISCORD_USER_ID:
+            await send_chunked(message.channel, "🔒 Only the bot owner can manage the restart allowlist.")
+            return
+
+        from tools.docker_manager import get_allowlist, _add_to_allowlist, _remove_from_allowlist
+
+        if trigger in ("!allowlist", "!allowlist list"):
+            current = sorted(get_allowlist())
+            text = (
+                "Current restart allowlist:\n" + "\n".join(f"- {c}" for c in current)
+                if current else
+                "The restart allowlist is currently empty — no containers can be restarted."
+            )
+            await send_chunked(message.channel, text)
+        elif trigger.startswith("!allowlist add "):
+            container_name = user_query.strip()[len("!allowlist add "):].strip()
+            await send_chunked(message.channel, _add_to_allowlist(container_name))
+        elif trigger.startswith("!allowlist remove "):
+            container_name = user_query.strip()[len("!allowlist remove "):].strip()
+            await send_chunked(message.channel, _remove_from_allowlist(container_name))
+        else:
+            await send_chunked(
+                message.channel,
+                "Usage: `!allowlist` (show current), `!allowlist add <container>`, "
+                "`!allowlist remove <container>`."
+            )
         return
 
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
