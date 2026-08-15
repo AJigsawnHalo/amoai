@@ -592,6 +592,38 @@ FACT_SUPERSESSION_BAND_MIN = 0.78
 FACT_INJECT_ALWAYS_UNDER = 8
 FACT_RELEVANCE_TOP_K = 8
 
+# Two facts whose embeddings score at or above this are treated as "about
+# the same underlying topic" for consolidation purposes — deliberately a
+# much looser band than FACT_SUPERSESSION_BAND_MIN above. Supersession is
+# about two facts being restatements of the SAME fact (one should replace
+# the other); this is about facts that are genuinely distinct but all
+# orbiting one subject (e.g. five separate facts about one worldbuilding
+# nation's government, motto, symbols, and history) — the case that
+# generates a wall of individual "remembered:" lines from one big source
+# dump without ever tripping dedup or supersession, since each is a real,
+# non-duplicate fact.
+CONSOLIDATION_TOPIC_THRESHOLD = 0.60
+# A cluster only gets merged once it has at least this many facts — small
+# clusters aren't worth the LLM call or the risk of losing detail.
+CONSOLIDATION_MIN_CLUSTER_SIZE = 3
+# Bounds worst-case GPU-time per consolidation pass regardless of how many
+# eligible clusters exist — each cluster is still its own isolated LLM
+# call (deliberately NOT batched into one call across clusters: a smaller
+# cloud model is meaningfully more prone to bleeding a detail from one
+# cluster into another's merged output when they're all in the same
+# prompt, and one bad/truncated response would take the whole pass down
+# instead of just one cluster). Only the largest N eligible clusters get
+# merged in a given pass; anything left over just persists and gets
+# caught on a later trigger — nothing is lost, only deferred.
+CONSOLIDATION_MAX_CLUSTERS_PER_PASS = 5
+# Consolidation isn't scheduled — it runs reactively, checked right before
+# a new fact would be added, so it fires exactly when a user is about to
+# hit or has hit MAX_FACTS_PER_USER, instead of on a clock. Margin of 5
+# gives it room to run BEFORE add_user_fact's own oldest-first trim would
+# otherwise silently delete anything.
+CONSOLIDATION_NEAR_CAP_MARGIN = 5
+CONSOLIDATION_TRIGGER_COUNT = MAX_FACTS_PER_USER - CONSOLIDATION_NEAR_CAP_MARGIN
+
 # Cheap pre-filter so extract_and_store_facts doesn't burn an LLM call on
 # every single message (most messages are acknowledgments or one-off
 # requests with nothing durable in them). False negatives here just mean a
@@ -1008,6 +1040,117 @@ def clear_user_facts(user_id: str):
     finally:
         conn.close()
 
+def _cluster_facts_by_topic(facts_with_emb: list) -> list:
+    """Groups facts into topic clusters via union-find over pairwise cosine
+    similarity at CONSOLIDATION_TOPIC_THRESHOLD. Same same-space-only
+    reasoning as _is_semantic_duplicate/_find_supersession_candidate — a
+    fact with no embedding, or in a different space than its neighbors,
+    just ends up alone in its own singleton cluster rather than being
+    force-grouped or dropped."""
+    n = len(facts_with_emb)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        emb_i = facts_with_emb[i][1]
+        if not emb_i:
+            continue
+        space_i, vec_i = emb_i
+        for j in range(i + 1, n):
+            emb_j = facts_with_emb[j][1]
+            if not emb_j or emb_j[0] != space_i:
+                continue
+            if cosine_similarity(vec_i, emb_j[1]) >= CONSOLIDATION_TOPIC_THRESHOLD:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(facts_with_emb[i])
+    return list(groups.values())
+
+async def _llm_consolidate_cluster(facts: list) -> "str | None":
+    """Merges a cluster of topically-related facts into one dense entry.
+    Explicitly told to preserve every specific (names, numbers, decisions)
+    rather than summarize them away — this is compaction, not
+    summarization; the goal is fewer rows holding the same information, not
+    less information. Returns None (leave the cluster alone) if the call
+    fails or comes back empty, same fail-safe posture as
+    _llm_decides_replace: a missed consolidation just means a few extra
+    rows survive, which is far less damaging than silently losing detail."""
+    facts_block = "\n".join(f"- {f}" for f in facts)
+    prompt = (
+        "These are separate memory entries stored about the same user, all "
+        "about the same underlying topic (likely captured one at a time "
+        "from one longer conversation or document). Merge them into ONE "
+        "consolidated entry — a short paragraph is fine. Preserve EVERY "
+        "specific detail (names, numbers, mottos, decisions, structure) "
+        "from all of them. Do not summarize any detail away, and do not "
+        "add anything that isn't already stated below. Only remove "
+        "redundant phrasing.\n\n"
+        f"{facts_block}\n\n"
+        "Reply with ONLY the merged entry, no preamble, no markdown."
+    )
+    try:
+        response = await query_llm(
+            {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "stream": False},
+            timeout=60,
+        )
+        merged = response.get("message", {}).get("content", "").strip()
+        return merged or None
+    except Exception as e:
+        print(f"[MEMORY] Consolidation skipped for one cluster (non-fatal): {e}")
+        return None
+
+async def consolidate_user_facts(user_id: str) -> "tuple[int, int] | None":
+    """Sweeps one user's facts for topic clusters and merges up to
+    CONSOLIDATION_MAX_CLUSTERS_PER_PASS of the largest clusters (each
+    CONSOLIDATION_MIN_CLUSTER_SIZE+ facts) into single consolidated entries.
+    Only runs once the user's fact count reaches CONSOLIDATION_TRIGGER_COUNT.
+    Returns (count_before, count_after) if anything was merged, else None."""
+    facts_with_emb = get_user_facts_with_embeddings(user_id)
+    before = len(facts_with_emb)
+    if before < CONSOLIDATION_TRIGGER_COUNT:
+        return None
+
+    clusters = _cluster_facts_by_topic(facts_with_emb)
+    eligible = [c for c in clusters if len(c) >= CONSOLIDATION_MIN_CLUSTER_SIZE]
+    # Largest clusters first — they free up the most rows per LLM call,
+    # which matters most since only the top N get processed this pass.
+    eligible.sort(key=len, reverse=True)
+    merged_any = False
+    for cluster in eligible[:CONSOLIDATION_MAX_CLUSTERS_PER_PASS]:
+        texts = [f for f, _ in cluster]
+        merged = await _llm_consolidate_cluster(texts)
+        if not merged:
+            continue  # leave this cluster untouched rather than risk losing detail
+        embedding = await _embed_fact(merged)
+        conn = _get_memory_conn()
+        try:
+            placeholders = ",".join("?" * len(texts))
+            conn.execute(
+                f"DELETE FROM facts WHERE user_id = ? AND fact IN ({placeholders})",
+                (str(user_id), *texts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        add_user_fact(user_id, merged, embedding)
+        merged_any = True
+
+    if not merged_any:
+        return None
+    return before, len(get_user_facts(user_id))
+
 async def get_relevant_facts_block(user_id: str, query: str) -> str:
     """Builds the "What you remember about this user" block for the system
     prompt. Small fact lists are sent whole; larger ones are trimmed to the
@@ -1100,8 +1243,20 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
             to_add.append(new_text)
 
     added = []
+    consolidation_summary = None
     if to_add:
         existing_for_dedup = get_user_facts_with_embeddings(user_id)
+        # Reactive, not scheduled: check right here, before any new fact is
+        # added, so this fires exactly when the user is about to hit or has
+        # hit the cap — running it now, ahead of add_user_fact's own
+        # oldest-first trim, is what lets consolidation replace that trim
+        # instead of losing anything to it.
+        if len(existing_for_dedup) >= CONSOLIDATION_TRIGGER_COUNT:
+            result = await consolidate_user_facts(user_id)
+            if result:
+                before, after = result
+                consolidation_summary = f"{before} → {after} facts"
+                existing_for_dedup = get_user_facts_with_embeddings(user_id)
         for fact in to_add:
             if not fact:
                 continue
@@ -1126,9 +1281,11 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
                 added.append(fact)
                 existing_for_dedup.append((fact, embedding))
 
-    if channel is not None and (added or updated_summaries):
+    if channel is not None and (added or updated_summaries or consolidation_summary):
         lines = [f"-# 🧠 remembered: {f}" for f in added]
         lines += [f"-# 🧠 updated: {s}" for s in updated_summaries]
+        if consolidation_summary:
+            lines.append(f"-# 🧠 consolidated: {consolidation_summary}")
         await send_chunked(channel, "\n".join(lines))
 
 DISCORD_LIMIT = 2000
