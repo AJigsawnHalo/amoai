@@ -12,6 +12,8 @@ python-dotenv==1.2.2
 psutil==7.2.2
 
 # PDF text extraction for file attachments (bot.py) and tools/rag_knowledge.py
+# pypdf is the primary reader; PyPDF2 is a deliberate fallback used only if
+# pypdf fails to import (see _extract_pdf_text in bot.py) — keep both.
 pypdf==6.14.2
 PyPDF2==3.0.1
 
