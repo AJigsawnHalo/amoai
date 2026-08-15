@@ -618,10 +618,10 @@ CONSOLIDATION_MIN_CLUSTER_SIZE = 3
 CONSOLIDATION_MAX_CLUSTERS_PER_PASS = 5
 # Consolidation isn't scheduled — it runs reactively, checked right before
 # a new fact would be added, so it fires exactly when a user is about to
-# hit or has hit MAX_FACTS_PER_USER, instead of on a clock. Margin of 5
+# hit or has hit MAX_FACTS_PER_USER, instead of on a clock. The margin
 # gives it room to run BEFORE add_user_fact's own oldest-first trim would
 # otherwise silently delete anything.
-CONSOLIDATION_NEAR_CAP_MARGIN = 5
+CONSOLIDATION_NEAR_CAP_MARGIN = 15
 CONSOLIDATION_TRIGGER_COUNT = MAX_FACTS_PER_USER - CONSOLIDATION_NEAR_CAP_MARGIN
 
 # Cheap pre-filter so extract_and_store_facts doesn't burn an LLM call on
@@ -1243,20 +1243,10 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
             to_add.append(new_text)
 
     added = []
-    consolidation_summary = None
+    consolidation_summaries = []
+    consolidation_exhausted = False
     if to_add:
         existing_for_dedup = get_user_facts_with_embeddings(user_id)
-        # Reactive, not scheduled: check right here, before any new fact is
-        # added, so this fires exactly when the user is about to hit or has
-        # hit the cap — running it now, ahead of add_user_fact's own
-        # oldest-first trim, is what lets consolidation replace that trim
-        # instead of losing anything to it.
-        if len(existing_for_dedup) >= CONSOLIDATION_TRIGGER_COUNT:
-            result = await consolidate_user_facts(user_id)
-            if result:
-                before, after = result
-                consolidation_summary = f"{before} → {after} facts"
-                existing_for_dedup = get_user_facts_with_embeddings(user_id)
         for fact in to_add:
             if not fact:
                 continue
@@ -1277,9 +1267,28 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
                         existing_for_dedup.append((fact, embedding))
                     continue
 
+            # Checked per-fact, not just once before the loop — a single
+            # message can extract many new facts at once (a big paste), and
+            # a single up-front check would let that whole batch sail past
+            # the cap before the sweep got a second look. consolidation_exhausted
+            # stops it from retrying every remaining iteration once a pass
+            # has genuinely found nothing left to merge — nothing changed,
+            # so an immediate retry can't help; add_user_fact's own trim
+            # remains the safety net for whatever's left in that case.
+            if not consolidation_exhausted and len(existing_for_dedup) >= CONSOLIDATION_TRIGGER_COUNT:
+                result = await consolidate_user_facts(user_id)
+                if result:
+                    before, after = result
+                    consolidation_summaries.append(f"{before} → {after} facts")
+                    existing_for_dedup = get_user_facts_with_embeddings(user_id)
+                else:
+                    consolidation_exhausted = True
+
             if add_user_fact(user_id, fact, embedding):
                 added.append(fact)
                 existing_for_dedup.append((fact, embedding))
+
+    consolidation_summary = "; ".join(consolidation_summaries) if consolidation_summaries else None
 
     if channel is not None and (added or updated_summaries or consolidation_summary):
         lines = [f"-# 🧠 remembered: {f}" for f in added]
