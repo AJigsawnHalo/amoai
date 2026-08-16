@@ -1496,7 +1496,7 @@ async def start_webhook_server():
     print(f"[WEBHOOK] Listening for arrival events on :{ARRIVAL_WEBHOOK_PORT}")
 
 async def send_chunked(channel, text: str):
-    text = text or ""
+    text = text or "⚠️ (empty response — check bot logs)"
     if len(text) <= DISCORD_LIMIT:
         await channel.send(text)
         return
@@ -2203,6 +2203,7 @@ async def on_message(message):
     max_loops = 5
     loop_count = 0
     running = True
+    last_tool_output = None
 
     ACTIVE_TASKS[user_id] = asyncio.current_task()
     relevant_tools = await select_relevant_tools(user_query)
@@ -2255,7 +2256,8 @@ async def on_message(message):
                                     output = f"Error running tool: {tool_err}"
 
                         log_tool_call(name, args, output, source="llm")
-                        
+                        last_tool_output = output
+
                         tool_message = {
                             "role": "tool",
                             "content": str(output),
@@ -2269,7 +2271,11 @@ async def on_message(message):
                     loop_count += 1
                     
                 else:
-                    response_text = message_data.get("content", "I processed that, but had nothing to say.")
+                    response_text = (
+                        message_data.get("content")
+                        or (f"✅ {last_tool_output}" if last_tool_output else None)
+                        or "I processed that, but had nothing to say."
+                    )
                     await send_chunked(message.channel, response_text)
                     record_turn(message.channel, user_query, response_text)
                     asyncio.create_task(maybe_suggest_thread(message, _get_conversation_message_count(message.channel.id)))
