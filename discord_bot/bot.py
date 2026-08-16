@@ -1080,25 +1080,29 @@ def _cluster_facts_by_topic(facts_with_emb: list) -> list:
 
 async def _llm_consolidate_cluster(facts: list) -> "str | None":
     """Merges a cluster of topically-related facts into one dense entry.
-    Explicitly told to preserve every specific (names, numbers, decisions)
-    rather than summarize them away — this is compaction, not
-    summarization; the goal is fewer rows holding the same information, not
-    less information. Returns None (leave the cluster alone) if the call
-    fails or comes back empty, same fail-safe posture as
+    This is real (lossy) summarization, not just compaction: the model is
+    told to keep only what's most important/distinctive and may drop minor
+    or lower-value specifics to actually shrink token footprint, not just
+    row count — the explicit tradeoff is fewer tokens in the prompt when
+    this entry gets injected, at the cost of losing the least-important
+    detail from the cluster. Returns None (leave the cluster alone) if the
+    call fails or comes back empty, same fail-safe posture as
     _llm_decides_replace: a missed consolidation just means a few extra
-    rows survive, which is far less damaging than silently losing detail."""
+    rows survive, which is far less damaging than a bad/empty summary
+    silently replacing real facts."""
     facts_block = "\n".join(f"- {f}" for f in facts)
     prompt = (
         "These are separate memory entries stored about the same user, all "
         "about the same underlying topic (likely captured one at a time "
-        "from one longer conversation or document). Merge them into ONE "
-        "consolidated entry — a short paragraph is fine. Preserve EVERY "
-        "specific detail (names, numbers, mottos, decisions, structure) "
-        "from all of them. Do not summarize any detail away, and do not "
-        "add anything that isn't already stated below. Only remove "
-        "redundant phrasing.\n\n"
+        "from one longer conversation or document). Summarize them into "
+        "ONE consolidated entry that is noticeably shorter than the "
+        "combined originals — a sentence or two, not a full paragraph. "
+        "Keep the most important and distinctive specifics (names, "
+        "numbers, key decisions); it's fine to drop minor or redundant "
+        "details to keep it short. Do not add anything that isn't already "
+        "stated below.\n\n"
         f"{facts_block}\n\n"
-        "Reply with ONLY the merged entry, no preamble, no markdown."
+        "Reply with ONLY the summarized entry, no preamble, no markdown."
     )
     try:
         response = await query_llm(
@@ -1111,15 +1115,20 @@ async def _llm_consolidate_cluster(facts: list) -> "str | None":
         print(f"[MEMORY] Consolidation skipped for one cluster (non-fatal): {e}")
         return None
 
-async def consolidate_user_facts(user_id: str) -> "tuple[int, int] | None":
-    """Sweeps one user's facts for topic clusters and merges up to
+async def consolidate_user_facts(user_id: str, force: bool = False) -> "tuple[int, int] | None":
+    """Sweeps one user's facts for topic clusters and summarizes up to
     CONSOLIDATION_MAX_CLUSTERS_PER_PASS of the largest clusters (each
-    CONSOLIDATION_MIN_CLUSTER_SIZE+ facts) into single consolidated entries.
-    Only runs once the user's fact count reaches CONSOLIDATION_TRIGGER_COUNT.
+    CONSOLIDATION_MIN_CLUSTER_SIZE+ facts) into single, shorter entries.
+    This is lossy — minor/redundant details from the cluster may not
+    survive — trading detail for a real reduction in both row count and
+    prompt-injection tokens. Only runs once the user's fact count reaches
+    CONSOLIDATION_TRIGGER_COUNT, unless force=True (used by the manual
+    !consolidate command to bypass that gate and sweep regardless of how
+    many facts are currently stored).
     Returns (count_before, count_after) if anything was merged, else None."""
     facts_with_emb = get_user_facts_with_embeddings(user_id)
     before = len(facts_with_emb)
-    if before < CONSOLIDATION_TRIGGER_COUNT:
+    if not force and before < CONSOLIDATION_TRIGGER_COUNT:
         return None
 
     clusters = _cluster_facts_by_topic(facts_with_emb)
@@ -2080,6 +2089,43 @@ async def on_message(message):
             )
         return
 
+    if trigger in ("!consolidate preview", "!consolidatepreview", "!consolidate dryrun"):
+        async with message.channel.typing():
+            results = await preview_consolidation(user_id, force=True)
+        if not results:
+            text = "Nothing to consolidate right now — no cluster of related facts is big enough to merge."
+        else:
+            parts = [f"🔍 Preview — {len(results)} cluster(s) would be affected by `!consolidate` "
+                     "(nothing has been changed):\n"]
+            for i, (originals, merged) in enumerate(results, 1):
+                block = f"**Cluster {i}** ({len(originals)} facts):\n" + "\n".join(
+                    f"- {f}" for f in originals
+                )
+                if merged:
+                    block += f"\n→ would become:\n{merged}"
+                else:
+                    block += "\n→ merge failed, would be left untouched"
+                parts.append(block)
+            parts.append("\nRun `!consolidate` to actually apply this.")
+            text = "\n\n".join(parts)
+        await send_chunked(message.channel, text)
+        return
+
+    if trigger in ("!consolidate", "!consolidatememory"):
+        async with message.channel.typing():
+            result = await consolidate_user_facts(user_id, force=True)
+        if result:
+            before, after = result
+            text = (
+                f"🧠 Consolidated your saved facts: {before} → {after} "
+                "(summarized, so some minor details may have been trimmed). "
+                "Use `!recall` to see the updated list."
+            )
+        else:
+            text = "Nothing to consolidate right now — no cluster of related facts was big enough to merge."
+        await send_chunked(message.channel, text)
+        return
+
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
         known_facts = get_user_facts(user_id)
         if known_facts:
@@ -2168,7 +2214,10 @@ async def on_message(message):
         "If the user asks what you remember, or how to clear it, tell them they can type "
         "!recall to see a numbered list of saved facts, !forget <number> to remove just one "
         "(!forget 1,3,5 or !forget 2-4 to remove several at once), "
-        "or !forget on its own to clear everything. "
+        "!forget on its own to clear everything, "
+        "!consolidate to manually summarize related facts into shorter entries right away "
+        "(this is lossy — minor details may be trimmed to actually save tokens), "
+        "or !consolidate preview to see what !consolidate would do first without changing anything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
         "You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. If you need to represent a matrix or a table, use a plain text grid or a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
