@@ -17,8 +17,13 @@ load_dotenv(find_dotenv())
 
 # --- CONFIGURATION ---
 SCRIPT_DIR = Path(__file__).resolve().parent
-STATE_FILE = Path(os.getenv("LOG_MONITOR_STATE_FILE", SCRIPT_DIR / "state.json"))
-LOCK_FILE = Path(os.getenv("LOG_MONITOR_LOCK_FILE", SCRIPT_DIR / "log_monitor.lock"))
+# `or` rather than getenv's own default= — os.getenv only falls back to the
+# default when the key is absent entirely. A literal `KEY=""` left over from
+# .env.example (present, but empty) would otherwise return "" as-is, and
+# Path("") resolves to the current directory — which then crashes with
+# "[Errno 21] Is a directory" the moment this tries to write to it.
+STATE_FILE = Path(os.getenv("LOG_MONITOR_STATE_FILE") or SCRIPT_DIR / "state.json")
+LOCK_FILE = Path(os.getenv("LOG_MONITOR_LOCK_FILE") or SCRIPT_DIR / "log_monitor.lock")
 
 # Reuses the email webhook if a dedicated one isn't set, so this works out of
 # the box in the same .env as email_sorter/monitor.py.

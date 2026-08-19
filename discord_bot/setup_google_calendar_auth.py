@@ -31,8 +31,12 @@ load_dotenv(find_dotenv())
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
-CREDENTIALS_FILE = Path(os.getenv("GOOGLE_CALENDAR_CREDENTIALS_FILE", _DATA_DIR / "google_calendar_credentials.json"))
-TOKEN_FILE = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_FILE", _DATA_DIR / "google_calendar_token.json"))
+# `or` rather than getenv's own default= — os.getenv only falls back to the
+# default when the key is absent entirely. A literal `KEY=""` left over from
+# .env.example (present, but empty) would otherwise return "" as-is, and
+# Path("") resolves to the current directory instead of the intended file.
+CREDENTIALS_FILE = Path(os.getenv("GOOGLE_CALENDAR_CREDENTIALS_FILE") or _DATA_DIR / "google_calendar_credentials.json")
+TOKEN_FILE = Path(os.getenv("GOOGLE_CALENDAR_TOKEN_FILE") or _DATA_DIR / "google_calendar_token.json")
 
 
 def main():
