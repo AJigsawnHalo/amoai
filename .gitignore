@@ -3,6 +3,7 @@
 discord_bot/*.json
 discord_bot/*.jsonl
 discord_bot/data/
+discord_bot/debug/
 log-monitor/*.json
 log-monitor/*.lock
 *.patch
