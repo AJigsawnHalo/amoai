@@ -1,11 +1,12 @@
 """
 memory_store.py — conversation history (per-channel rolling window +
-persistent log) and long-term per-user facts (SQLite-backed), including
-dedup, supersession, and consolidation.
+persistent log) and long-term per-user facts, now organized into topics
+(SQLite-backed), including dedup, supersession, per-topic consolidation,
+and one-time migration of pre-topic facts.
 
-Both conversation_log and facts go through the SAME SQLite connection
-(_get_memory_conn) and the same database file — this module owns that
-connection/schema; nothing else should open MEMORY_DB_PATH directly.
+Both conversation_log and facts/topics go through the SAME SQLite
+connection (_get_memory_conn) and the same database file — this module owns
+that connection/schema; nothing else should open MEMORY_DB_PATH directly.
 
 extract_and_store_facts() needs messaging.send_chunked to post "remembered:"
 notices, but messaging.py needs get_channel_history/_append_conversation_log
@@ -14,6 +15,20 @@ importing messaging lazily, inside the one function that needs it, rather
 than at module load time (see the `import messaging` inside
 extract_and_store_facts below). messaging.py's top-level `import
 memory_store` stays a normal import; this is the module that defers.
+
+TOPIC MODEL: every fact belongs to exactly one topic (a short label like
+"Rutrinda worldbuilding", or the standing "General" bucket for genuine
+one-offs). New facts get a topic proposed by the extraction LLM call, then
+canonicalized against the user's existing topics (exact match, then
+embedding similarity) so slightly different wording doesn't spawn
+near-duplicate topics. Cross-topic fact text stays globally unique per user
+(facts.UNIQUE(user_id, fact) has no topic scoping) — this also means
+merge_topics() can safely reassign topic_id without ever risking a
+collision on fact text.
+
+Nothing here relies on SQLite's ON DELETE CASCADE (whose enforcement
+depends on a per-connection PRAGMA this codebase doesn't set) — anywhere a
+topic is deleted, its facts are moved or deleted explicitly first.
 """
 import json
 import re
@@ -49,7 +64,7 @@ def _history_cap_messages(channel) -> int:
     return turns * 2
 
 
-# --- PERSISTENT USER MEMORY (SQLite-backed) ---
+# --- PERSISTENT USER MEMORY (SQLite-backed, topic-organized) ---
 # Was a flat memory_store.json capped at 40 facts/user. Moved to SQLite
 # (same pattern as tools/rag_knowledge.py's vector store) so raising the cap
 # is just a number, not a rewrite, and per-user lookups don't require
@@ -59,7 +74,25 @@ MEMORY_DB_PATH = config.DATA_DIR / "memory_store.sqlite3"
 # ever read once, by the migration below, and deliberately left wherever it
 # already sits (see migrate_data_layout.py, which does not move it either).
 LEGACY_MEMORY_FILE = config.DATA_DIR.parent / "memory_store.json"
-MAX_FACTS_PER_USER = 200  # was 40 on the old JSON store
+MAX_FACTS_PER_USER = 200  # global safety cap across all of a user's topics combined
+
+# Every fact belongs to a topic. Genuine one-offs with no ongoing subject
+# land here rather than spawning a single-fact topic of their own.
+DEFAULT_TOPIC_LABEL = "General"
+# Standing topic for durable facts about the user's own identity,
+# personality, habits, and preferences — as opposed to facts that belong to
+# a specific ongoing project, world, or subject (which get their own named
+# topic instead). Without this as an explicit, always-available option,
+# personal facts tend to get glued onto whatever project topic happens to
+# be active in the conversation at the time, or scattered into General.
+USER_TOPIC_LABEL = "About You"
+# Two topic labels whose embeddings score at or above this are treated as
+# the same underlying topic — this is what lets "Rutrinda" and "The world
+# of Rutrinda" resolve to one topic instead of two, even when the
+# extraction model doesn't reuse the existing label verbatim. Looser than
+# fact-level dedup since topic labels are short and paraphrase more freely
+# than full sentences.
+TOPIC_MATCH_THRESHOLD = 0.75
 
 # Two facts whose embeddings score at or above this are close enough to be
 # treated as verbatim the same and skipped outright — no need to even ask
@@ -78,6 +111,9 @@ FACT_DEDUP_THRESHOLD = 0.93
 # Start conservative; if it's still merging facts that were actually meant
 # to coexist, raise this number, and if near-duplicates keep slipping
 # through as separate entries, lower it.
+# Dedup/supersession stay CROSS-TOPIC deliberately — a fact restated while
+# talking about a different topic should still be recognized as the same
+# fact, not silently duplicated because it landed in a different bucket.
 FACT_SUPERSESSION_BAND_MIN = 0.78
 # Fact lists at or under this size are injected into the system prompt
 # whole — not worth the embedding/ranking overhead. Above it, only the
@@ -92,11 +128,9 @@ FACT_RELEVANCE_TOP_K = 8
 # much looser band than FACT_SUPERSESSION_BAND_MIN above. Supersession is
 # about two facts being restatements of the SAME fact (one should replace
 # the other); this is about facts that are genuinely distinct but all
-# orbiting one subject (e.g. five separate facts about one worldbuilding
-# nation's government, motto, symbols, and history) — the case that
-# generates a wall of individual "remembered:" lines from one big source
-# dump without ever tripping dedup or supersession, since each is a real,
-# non-duplicate fact.
+# orbiting one subject — used both for sub-clustering WITHIN a topic during
+# consolidation, and for the one-time migration that groups pre-topic facts
+# into topics in the first place.
 CONSOLIDATION_TOPIC_THRESHOLD = 0.60
 # A cluster only gets merged once it has at least this many facts — small
 # clusters aren't worth the LLM call or the risk of losing detail.
@@ -111,13 +145,20 @@ CONSOLIDATION_MIN_CLUSTER_SIZE = 3
 # merged in a given pass; anything left over just persists and gets
 # caught on a later trigger — nothing is lost, only deferred.
 CONSOLIDATION_MAX_CLUSTERS_PER_PASS = 5
-# Consolidation isn't scheduled — it runs reactively, checked right before
-# a new fact would be added, so it fires exactly when a user is about to
-# hit or has hit MAX_FACTS_PER_USER, instead of on a clock. The margin
-# gives it room to run BEFORE add_user_fact's own oldest-first trim would
-# otherwise silently delete anything.
-CONSOLIDATION_NEAR_CAP_MARGIN = 15
-CONSOLIDATION_TRIGGER_COUNT = MAX_FACTS_PER_USER - CONSOLIDATION_NEAR_CAP_MARGIN
+# Per-topic reactive trigger — checked against a single topic's OWN fact
+# count right after a new fact is filed under it, not the user's total
+# across all topics. This is what actually solves topic fragmentation
+# during a single session: a topic like "Rutrinda worldbuilding" gets
+# tidied on its own once it individually grows large, instead of waiting
+# for the user's entire fact count to approach MAX_FACTS_PER_USER.
+CONSOLIDATION_TOPIC_TRIGGER_COUNT = 20
+# Migration-time clustering uses a lower bar than consolidation's
+# CONSOLIDATION_MIN_CLUSTER_SIZE — this is about INITIAL categorization
+# (does this fact belong with others, or is it a one-off for General), not
+# about whether a cluster is big enough to be worth an LLM summarization
+# call. Two related pre-topic facts already deserve their own topic even if
+# they're not yet big enough to warrant condensing.
+MIGRATION_MIN_CLUSTER_SIZE = 2
 
 # Cheap pre-filter so extract_and_store_facts doesn't burn an LLM call on
 # every single message (most messages are acknowledgments or one-off
@@ -141,6 +182,21 @@ def _looks_low_signal(text: str) -> bool:
 
 def _get_memory_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(MEMORY_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            summary TEXT,
+            embedding TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, label COLLATE NOCASE)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_topics_user ON topics(user_id)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS facts (
@@ -173,17 +229,25 @@ def _get_memory_conn() -> sqlite3.Connection:
         )
         """
     )
-    # Additive migration for DBs created before updated_at/embedding existed.
+    # Additive migration for DBs created before these columns existed.
     # ADD COLUMN has no "IF NOT EXISTS" in SQLite, so this just no-ops with
     # an OperationalError ("duplicate column") on every run after the first.
     for ddl in (
         "ALTER TABLE facts ADD COLUMN updated_at TEXT",
         "ALTER TABLE facts ADD COLUMN embedding TEXT",
+        # Nullable, NOT "NOT NULL" — existing rows predate topics and start
+        # out unassigned; migrate_facts_to_topics() backfills them at
+        # startup. Every NEW fact from add_user_fact() onward always
+        # receives a real topic_id, so in practice this is non-null for
+        # anything written going forward, even though the column itself
+        # can't enforce that retroactively on rows that already existed.
+        "ALTER TABLE facts ADD COLUMN topic_id INTEGER REFERENCES topics(id)",
     ):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
             pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_topic ON facts(topic_id)")
     return conn
 
 
@@ -304,7 +368,7 @@ def _set_last_thread_suggestion(channel_id, history_length: int):
         conn.close()
 
 
-# --- fact embedding helpers ---
+# --- embedding helpers (shared by facts AND topic labels) ---
 
 def _encode_embedding(embedding: "tuple[str, list[float]] | None") -> "str | None":
     if not embedding:
@@ -326,13 +390,14 @@ def _parse_embedding(raw: "str | None") -> "tuple[str, list[float]] | None":
         return None
 
 
-async def _embed_fact(text: str) -> "tuple[str, list[float]] | None":
-    """Tiered embedding for a fact or a query string — same fallback order
-    as embeddings.select_relevant_tools(): Gemini primary, local nomic only
-    when chat is currently on the local backend. Returns (space, vector)
-    rather than a bare vector so callers only ever compare vectors embedded
-    in the same space — Gemini and local vectors are never comparable to
-    each other (see the note on embeddings.TOOL_EMBEDDINGS_LOCAL)."""
+async def _embed_text(text: str) -> "tuple[str, list[float]] | None":
+    """Tiered embedding for any piece of text — a fact, a query string, or a
+    topic label. Same fallback order as embeddings.select_relevant_tools():
+    Gemini primary, local nomic only when chat is currently on the local
+    backend. Returns (space, vector) rather than a bare vector so callers
+    only ever compare vectors embedded in the same space — Gemini and local
+    vectors are never comparable to each other (see the note on
+    embeddings.TOOL_EMBEDDINGS_LOCAL)."""
     emb = await embeddings.get_embedding(text)
     if emb is not None:
         return "gemini", emb
@@ -346,7 +411,10 @@ async def _embed_fact(text: str) -> "tuple[str, list[float]] | None":
 def _migrate_legacy_json_memory():
     """One-time migration from the old memory_store.json into SQLite. Runs
     at import time; no-ops once the JSON file is gone or already migrated
-    (renamed to .json.migrated on success, so this only ever runs once)."""
+    (renamed to .json.migrated on success, so this only ever runs once).
+    Facts land with topic_id NULL, same as any other pre-topic fact —
+    migrate_facts_to_topics() (run at startup, see bot.py's on_ready) picks
+    them up from there."""
     if not LEGACY_MEMORY_FILE.exists():
         return
     try:
@@ -385,7 +453,385 @@ def _migrate_legacy_json_memory():
 _migrate_legacy_json_memory()
 
 
+# --- topics ---
+
+def _get_user_topics_with_embeddings(user_id: str) -> list:
+    """[(topic_id, label, (space, vector) | None), ...]"""
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, label, embedding FROM topics WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(tid, label, _parse_embedding(raw)) for tid, label, raw in rows]
+
+
+async def get_or_create_topic(user_id: str, proposed_label: str) -> int:
+    """Resolves a proposed topic label to an existing topic — exact
+    case-insensitive match first (cheap, no embedding needed), then
+    embedding similarity >= TOPIC_MATCH_THRESHOLD — or creates a new one.
+    This is what keeps "Rutrinda" and "The world of Rutrinda" from becoming
+    two separate topics just because the extraction model phrased its
+    proposal differently across calls."""
+    proposed_label = proposed_label.strip() or DEFAULT_TOPIC_LABEL
+
+    conn = _get_memory_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM topics WHERE user_id = ? AND lower(label) = lower(?)",
+            (str(user_id), proposed_label),
+        ).fetchone()
+        if row:
+            return row[0]
+    finally:
+        conn.close()
+
+    existing_topics = _get_user_topics_with_embeddings(user_id)
+    embedding = await _embed_text(proposed_label)
+    if embedding is not None and existing_topics:
+        space, vector = embedding
+        best_id, best_score = None, 0.0
+        for tid, _label, existing_emb in existing_topics:
+            if not existing_emb or existing_emb[0] != space:
+                continue
+            score = embeddings.cosine_similarity(vector, existing_emb[1])
+            if score > best_score:
+                best_id, best_score = tid, score
+        if best_id is not None and best_score >= TOPIC_MATCH_THRESHOLD:
+            return best_id
+
+    conn = _get_memory_conn()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            cur = conn.execute(
+                "INSERT INTO topics (user_id, label, embedding, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (str(user_id), proposed_label, _encode_embedding(embedding), now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            # Another concurrent message for this user created this exact
+            # label between our check above and this insert — use theirs.
+            row = conn.execute(
+                "SELECT id FROM topics WHERE user_id = ? AND lower(label) = lower(?)",
+                (str(user_id), proposed_label),
+            ).fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
+
+
+async def get_default_topic_id(user_id: str) -> int:
+    return await get_or_create_topic(user_id, DEFAULT_TOPIC_LABEL)
+
+
+async def get_user_topic_id(user_id: str) -> int:
+    return await get_or_create_topic(user_id, USER_TOPIC_LABEL)
+
+
+def get_user_topics(user_id: str) -> list:
+    """Returns [(label, fact_count), ...] for !topics — regular topics in
+    creation order, then "About You", then "General" always last."""
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.label, COUNT(f.id) as cnt
+            FROM topics t LEFT JOIN facts f ON f.topic_id = t.id
+            WHERE t.user_id = ?
+            GROUP BY t.id
+            ORDER BY
+                CASE
+                    WHEN lower(t.label) = lower(?) THEN 2
+                    WHEN lower(t.label) = lower(?) THEN 1
+                    ELSE 0
+                END ASC,
+                t.id ASC
+            """,
+            (str(user_id), DEFAULT_TOPIC_LABEL, USER_TOPIC_LABEL),
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+def rename_topic_sync(user_id: str, old_label: str, new_label: str) -> "tuple[str, str] | None":
+    """Case-insensitive match on old_label; renames in place (same row,
+    same facts, same topic_id — nothing about the linked facts changes).
+    Returns (matched_old_label, new_label) on success, None if old_label
+    didn't match anything, or if new_label collides with a DIFFERENT
+    existing topic (merge_topics is the tool for combining two topics, not
+    a rename that happens to collide)."""
+    new_label = new_label.strip()
+    if not new_label:
+        return None
+    conn = _get_memory_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, label FROM topics WHERE user_id = ? AND lower(label) = lower(?)",
+            (str(user_id), old_label.strip()),
+        ).fetchone()
+        if not row:
+            return None
+        topic_id, matched_label = row
+
+        collision = conn.execute(
+            "SELECT id FROM topics WHERE user_id = ? AND lower(label) = lower(?) AND id != ?",
+            (str(user_id), new_label, topic_id),
+        ).fetchone()
+        if collision:
+            return None
+
+        conn.execute(
+            "UPDATE topics SET label = ?, updated_at = ? WHERE id = ?",
+            (new_label, datetime.now(timezone.utc).isoformat(), topic_id),
+        )
+        conn.commit()
+        return matched_label, new_label
+    finally:
+        conn.close()
+
+
+async def rename_topic(user_id: str, old_label: str, new_label: str) -> "tuple[str, str] | None":
+    """Same as rename_topic_sync, but also re-embeds the new label so future
+    get_or_create_topic() calls canonicalize against the renamed text, not
+    the stale one."""
+    result = rename_topic_sync(user_id, old_label, new_label)
+    if result is None:
+        return None
+    embedding = await _embed_text(new_label)
+    if embedding is not None:
+        conn = _get_memory_conn()
+        try:
+            conn.execute(
+                "UPDATE topics SET embedding = ? WHERE user_id = ? AND lower(label) = lower(?)",
+                (_encode_embedding(embedding), str(user_id), new_label),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return result
+
+
+def merge_topics(user_id: str, keep_label: str, remove_label: str) -> "tuple[str, str, int] | None":
+    """Moves every fact from remove_label's topic into keep_label's, then
+    deletes the now-empty remove_label topic row. Safe against a fact-text
+    collision — facts.UNIQUE(user_id, fact) is global per user, not scoped
+    per topic, so the same fact text can never already exist in both. Moving
+    is just an UPDATE of topic_id, never touches fact text.
+    Returns (matched_keep_label, matched_remove_label, moved_count) on
+    success, or None if either label doesn't match, or both resolve to the
+    same topic."""
+    conn = _get_memory_conn()
+    try:
+        keep_row = conn.execute(
+            "SELECT id, label FROM topics WHERE user_id = ? AND lower(label) = lower(?)",
+            (str(user_id), keep_label.strip()),
+        ).fetchone()
+        remove_row = conn.execute(
+            "SELECT id, label FROM topics WHERE user_id = ? AND lower(label) = lower(?)",
+            (str(user_id), remove_label.strip()),
+        ).fetchone()
+        if not keep_row or not remove_row:
+            return None
+        keep_id, keep_matched = keep_row
+        remove_id, remove_matched = remove_row
+        if keep_id == remove_id:
+            return None
+
+        moved = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE user_id = ? AND topic_id = ?",
+            (str(user_id), remove_id),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE facts SET topic_id = ? WHERE user_id = ? AND topic_id = ?",
+            (keep_id, str(user_id), remove_id),
+        )
+        conn.execute("DELETE FROM topics WHERE id = ?", (remove_id,))
+        conn.commit()
+        return keep_matched, remove_matched, moved
+    finally:
+        conn.close()
+
+
+# Facts per LLM call when reclassifying a topic — bounds prompt size and
+# limits how much one bad/truncated response can affect at once, same
+# reasoning as CONSOLIDATION_MAX_CLUSTERS_PER_PASS.
+RECLASSIFY_BATCH_SIZE = 40
+
+
+async def _llm_propose_topics_for_facts(facts: list, existing_topic_labels: list) -> "list[str] | None":
+    """Batch LLM call: given up to RECLASSIFY_BATCH_SIZE facts, proposes a
+    topic label PER fact — the same per-fact judgment extract_and_store_facts
+    uses for a fact as it arrives, just applied retroactively to a batch of
+    already-stored facts in one call instead of one message at a time.
+
+    This exists because embedding-similarity clustering (used by the
+    one-time migrate_facts_to_topics()) can under-connect a large,
+    thematically diffuse set of facts that a reader would recognize as
+    clearly related but whose individual embeddings don't score close
+    enough pairwise — a worldbuilding project with many distinct named
+    entities (nations, mottos, technology, history) is exactly this case.
+    An LLM reading the fact directly doesn't have that failure mode.
+
+    Returns a list of labels, same length/order as `facts`, or None if the
+    call fails or the response can't be parsed into exactly that many
+    labels — caller leaves that batch untouched rather than guess."""
+    facts_block = "\n".join(f"{i + 1}. {f}" for i, f in enumerate(facts))
+    topics_block = ", ".join(existing_topic_labels) if existing_topic_labels else "(none yet)"
+    prompt = (
+        "Below is a numbered list of facts stored about a user. For EACH "
+        "fact, propose a short topic label (2-5 words) naming the ongoing "
+        "subject it belongs to. Decide which of these three cases applies:\n"
+        "1. The fact is about the user's OWN identity, personality, "
+        "habits, tools they use, or preferences that hold true regardless "
+        "of which project or topic they're discussing (who they are, not "
+        'what they\'re working on) — use exactly "About You" for these.\n'
+        "2. The fact is part of a specific ongoing project, world, or "
+        "subject — reuse an existing topic label below if it clearly "
+        "continues that subject. Only propose a new label for a genuinely "
+        "different ongoing subject — and reuse the SAME new label across "
+        "facts that share that subject, rather than inventing a slightly "
+        "different wording for each one. This includes an opinion, "
+        "struggle, or preference that's SPECIFIC to that project (e.g. "
+        '"finds writing a particular character difficult", "wants the '
+        'story to end differently") — these stay with the project\'s '
+        "topic even though they're phrased as being about the user. "
+        '"About You" is only for things true about the user independent '
+        "of which project is being discussed.\n"
+        "3. A true one-off with no lasting category and not about the "
+        'user\'s own identity — use exactly "General".\n\n'
+        f"Existing topics: {topics_block}\n\n"
+        f"Facts:\n{facts_block}\n\n"
+        "Reply with ONLY a JSON array of strings, one topic label per fact, "
+        "in the same order and the same length as the numbered list above. "
+        'Example: ["About You", "Label A", "General"]'
+    )
+    try:
+        response = await llm.query_llm(
+            {"model": config.MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "stream": False},
+            timeout=60,
+        )
+        raw = response.get("message", {}).get("content", "[]").strip().strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and len(parsed) == len(facts):
+            return [str(label).strip() or DEFAULT_TOPIC_LABEL for label in parsed]
+        return None
+    except Exception as e:
+        print(f"[MEMORY] Reclassification batch skipped (non-fatal): {e}")
+        return None
+
+
+async def reclassify_topic(user_id: str, topic_label: str) -> "tuple[int, int] | None":
+    """Manual remediation for a topic — typically General — that ended up
+    too broad. Re-runs classification on every fact currently filed under
+    `topic_label` using _llm_propose_topics_for_facts (LLM judgment) instead
+    of migration's embedding-distance clustering, and moves each fact to
+    whatever topic the LLM proposes (via the same get_or_create_topic
+    canonicalization new facts already go through). The topic being
+    reclassified is deliberately excluded from the "existing topics" list
+    shown to the LLM, so it's not just handed its own label as the easy
+    answer — "General" is still available as a genuine fallback, but only
+    via the prompt's explicit instruction, not because it's sitting in the
+    reuse-this-list.
+    Returns (total_facts_in_topic, facts_moved_to_a_different_topic) on
+    success, or None if topic_label doesn't match an existing topic or it
+    currently has no facts."""
+    conn = _get_memory_conn()
+    try:
+        topic_row = conn.execute(
+            "SELECT id FROM topics WHERE user_id = ? AND lower(label) = lower(?)",
+            (str(user_id), topic_label.strip()),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not topic_row:
+        return None
+    source_topic_id = topic_row[0]
+
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, fact FROM facts WHERE user_id = ? AND topic_id = ? ORDER BY id ASC",
+            (str(user_id), source_topic_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return None
+
+    moved = 0
+    for start in range(0, len(rows), RECLASSIFY_BATCH_SIZE):
+        batch = rows[start:start + RECLASSIFY_BATCH_SIZE]
+        existing_labels = [
+            label for label, _c in get_user_topics(user_id)
+            if label.lower() != topic_label.strip().lower()
+        ]
+        proposed = await _llm_propose_topics_for_facts([fact for _fid, fact in batch], existing_labels)
+        if proposed is None:
+            continue  # leave this batch untouched rather than guess
+
+        for (fact_id, _fact_text), new_label in zip(batch, proposed):
+            new_topic_id = await get_or_create_topic(user_id, new_label)
+            if new_topic_id != source_topic_id:
+                conn = _get_memory_conn()
+                try:
+                    conn.execute("UPDATE facts SET topic_id = ? WHERE id = ?", (new_topic_id, fact_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+                moved += 1
+
+    return len(rows), moved
+
+
+async def move_fact_to_topic(user_id: str, position: int, topic_label: str) -> "tuple[str, str] | None":
+    """Manual override for a single fact — moves the fact at !recall
+    position `position` (1-based, same continuous cross-topic ordering as
+    get_user_facts_ordered_with_topics/remove_user_facts) to `topic_label`
+    (an existing topic reused via the same canonicalization new facts
+    already go through, or a brand new one). This exists because LLM
+    classification — however good the prompt — will occasionally get a
+    genuinely ambiguous case wrong (a project-specific opinion phrased as
+    being about the user, for instance), and the person who actually knows
+    where a fact belongs should always be able to just say so directly
+    rather than being stuck re-running reclassify and hoping it lands
+    differently.
+    Returns (fact_text, resolved_topic_label) on success — resolved_topic_label
+    is what the fact actually got filed under, which may differ from
+    `topic_label` if it canonicalized to an existing topic with slightly
+    different wording. Returns None if `position` is out of range."""
+    rows = get_user_facts_ordered_with_topics(user_id)
+    pos = position - 1
+    if not (0 <= pos < len(rows)):
+        return None
+    fact_id, _old_topic_label, fact_text = rows[pos]
+
+    topic_id = await get_or_create_topic(user_id, topic_label)
+    conn = _get_memory_conn()
+    try:
+        conn.execute("UPDATE facts SET topic_id = ? WHERE id = ?", (topic_id, fact_id))
+        conn.commit()
+        resolved_row = conn.execute("SELECT label FROM topics WHERE id = ?", (topic_id,)).fetchone()
+    finally:
+        conn.close()
+
+    resolved_label = resolved_row[0] if resolved_row else topic_label
+    return fact_text, resolved_label
+
+
+# --- facts ---
+
 def get_user_facts(user_id: str) -> list:
+    """Flat, cross-topic list of fact text only — used where topic grouping
+    doesn't matter (the extraction prompt's existing-facts block for
+    add/update decisions, which needs to see everything regardless of
+    which topic it's filed under)."""
     conn = _get_memory_conn()
     try:
         rows = conn.execute(
@@ -398,12 +844,13 @@ def get_user_facts(user_id: str) -> list:
 
 
 def get_user_facts_with_embeddings(user_id: str) -> list:
-    """Returns [(fact, (space, vector) | None), ...] for this user — used for
-    semantic dedup and relevance ranking. Facts stored before embeddings
-    existed, or whose embedding call failed at the time, come back with
-    None; callers treat those as always-relevant/always-distinct rather than
-    hiding them, same philosophy as embeddings.select_relevant_tools() for
-    tools with no cached embedding."""
+    """Flat, cross-topic [(fact, (space, vector) | None), ...] — used for
+    dedup/supersession, which are deliberately cross-topic (see the module
+    docstring). Facts stored before embeddings existed, or whose embedding
+    call failed at the time, come back with None; callers treat those as
+    always-relevant/always-distinct rather than hiding them, same
+    philosophy as embeddings.select_relevant_tools() for tools with no
+    cached embedding."""
     conn = _get_memory_conn()
     try:
         rows = conn.execute(
@@ -415,9 +862,65 @@ def get_user_facts_with_embeddings(user_id: str) -> list:
     return [(fact, _parse_embedding(raw)) for fact, raw in rows]
 
 
-def add_user_fact(user_id: str, fact: str, embedding: "tuple[str, list[float]] | None" = None) -> bool:
-    """Inserts a single fact. Returns False if it already exists verbatim for
-    this user (UNIQUE constraint) or the fact is blank — semantic near-dupes
+def get_user_facts_ordered_with_topics(user_id: str) -> list:
+    """Returns [(fact_id, topic_label, fact_text), ...] in the SAME stable
+    order !recall displays and !forget's numeric positions refer to —
+    regular topics in creation order, then "About You", then "General"
+    always last, facts within a topic in creation order. Both !recall's
+    display and remove_user_facts() read this exact ordering so a position
+    never means two different things between what's shown and what gets
+    removed."""
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT f.id, t.label, f.fact
+            FROM facts f JOIN topics t ON f.topic_id = t.id
+            WHERE f.user_id = ?
+            ORDER BY
+                CASE
+                    WHEN lower(t.label) = lower(?) THEN 2
+                    WHEN lower(t.label) = lower(?) THEN 1
+                    ELSE 0
+                END ASC,
+                t.id ASC, f.id ASC
+            """,
+            (str(user_id), DEFAULT_TOPIC_LABEL, USER_TOPIC_LABEL),
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+def _get_topic_facts_with_embeddings(user_id: str, topic_id: int) -> list:
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT fact, embedding FROM facts WHERE user_id = ? AND topic_id = ? ORDER BY id ASC",
+            (str(user_id), topic_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(fact, _parse_embedding(raw)) for fact, raw in rows]
+
+
+def _count_topic_facts(user_id: str, topic_id: int) -> int:
+    conn = _get_memory_conn()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE user_id = ? AND topic_id = ?",
+            (str(user_id), topic_id),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def add_user_fact(
+    user_id: str, fact: str, topic_id: int, embedding: "tuple[str, list[float]] | None" = None
+) -> bool:
+    """Inserts a single fact under the given topic. Returns False if it
+    already exists verbatim for this user (UNIQUE constraint — global per
+    user, not scoped by topic) or the fact is blank — semantic near-dupes
     should be filtered by the caller with _is_semantic_duplicate before this
     is ever reached."""
     fact = fact.strip()
@@ -427,16 +930,20 @@ def add_user_fact(user_id: str, fact: str, embedding: "tuple[str, list[float]] |
     try:
         now = datetime.now(timezone.utc).isoformat()
         cur = conn.execute(
-            "INSERT OR IGNORE INTO facts (user_id, fact, created_at, updated_at, embedding) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (str(user_id), fact, now, now, _encode_embedding(embedding)),
+            "INSERT OR IGNORE INTO facts (user_id, topic_id, fact, created_at, updated_at, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (str(user_id), topic_id, fact, now, now, _encode_embedding(embedding)),
         )
         inserted = bool(cur.rowcount)
         conn.commit()
 
         if inserted:
-            # Enforce the per-user cap by trimming the oldest rows beyond it,
-            # same "keep the newest N" behavior the old JSON store had.
+            # Enforce the per-user cap (across ALL topics combined) by
+            # trimming the oldest rows beyond it, same "keep the newest N"
+            # behavior the old JSON store had. This is a blunt last-resort
+            # safety valve — per-topic consolidation (see
+            # CONSOLIDATION_TOPIC_TRIGGER_COUNT) is what's meant to keep
+            # things tidy well before this ever has to trim anything.
             count = conn.execute(
                 "SELECT COUNT(*) FROM facts WHERE user_id = ?", (str(user_id),)
             ).fetchone()[0]
@@ -460,11 +967,13 @@ def update_user_fact(
     user_id: str, old_fact: str, new_fact: str, embedding: "tuple[str, list[float]] | None" = None
 ) -> "tuple[str, str] | None":
     """Finds old_fact by case-insensitive exact match and rewrites its text
-    and embedding in place, preserving its row rather than appending — this
-    is what lets a revised fact ("moved to Manila") supersede the old one
-    ("lives in Calumpit") instead of both persisting side by side forever.
-    Returns (old_text, new_text) on success, or None if old_fact wasn't
-    found (the caller should then treat it as a plain add)."""
+    and embedding in place, preserving its row (and therefore its existing
+    topic_id — a revised fact stays under whatever topic it was already
+    filed in) rather than appending. This is what lets a revised fact
+    ("moved to Manila") supersede the old one ("lives in Calumpit") instead
+    of both persisting side by side forever. Returns (old_text, new_text) on
+    success, or None if old_fact wasn't found (the caller should then treat
+    it as a plain add)."""
     new_fact = new_fact.strip()
     if not new_fact:
         return None
@@ -493,7 +1002,7 @@ def _is_semantic_duplicate(
     """True if `embedding` is close enough to something already stored that
     a new row isn't worth adding. Only ever compares within the same
     embedding space (Gemini vs local vectors are not comparable — see
-    _embed_fact); if either side has no embedding this returns False rather
+    _embed_text); if either side has no embedding this returns False rather
     than silently dropping a fact it can't judge."""
     if not embedding:
         return False
@@ -567,6 +1076,9 @@ async def _llm_decides_replace(existing_fact: str, new_fact: str) -> bool:
 
 
 def remove_user_fact(user_id: str, identifier: str):
+    """Text-based /!forget <text> lookup — stays cross-topic, unaffected by
+    grouping (a fact is found by its own text/position regardless of which
+    topic it's filed under)."""
     conn = _get_memory_conn()
     try:
         rows = conn.execute(
@@ -633,49 +1145,52 @@ def _parse_fact_indices(spec: str) -> "list[int] | None":
 
 
 def remove_user_facts(user_id: str, indices: list) -> tuple:
-    """Removes multiple facts at once by their 1-based !recall position.
-    All positions are resolved against a single snapshot of the current
-    list before anything is deleted, so removing e.g. both 1 and 3 in the
-    same call is safe — an earlier deletion never shifts what a later index
-    refers to. Returns (removed_texts, invalid_positions); invalid_positions
-    covers anything out of range so the caller can report it back."""
-    conn = _get_memory_conn()
-    try:
-        rows = conn.execute(
-            "SELECT id, fact FROM facts WHERE user_id = ? ORDER BY id ASC",
-            (str(user_id),),
-        ).fetchall()
+    """Removes multiple facts at once by their 1-based !recall position —
+    positions refer to get_user_facts_ordered_with_topics()'s ordering
+    (continuous across all topics), the SAME ordering !recall displays, so
+    a number always means the same fact in both places. All positions are
+    resolved against a single snapshot before anything is deleted, so
+    removing e.g. both 1 and 3 in the same call is safe — an earlier
+    deletion never shifts what a later index refers to. Returns
+    (removed_descriptions, invalid_positions); invalid_positions covers
+    anything out of range so the caller can report it back."""
+    rows = get_user_facts_ordered_with_topics(user_id)
 
-        removed_texts, invalid, to_delete_ids = [], [], []
-        for idx in indices:
-            pos = idx - 1
-            if 0 <= pos < len(rows):
-                row_id, fact = rows[pos]
-                to_delete_ids.append(row_id)
-                removed_texts.append(fact)
-            else:
-                invalid.append(idx)
+    removed, invalid, to_delete_ids = [], [], []
+    for idx in indices:
+        pos = idx - 1
+        if 0 <= pos < len(rows):
+            fact_id, topic_label, fact_text = rows[pos]
+            to_delete_ids.append(fact_id)
+            removed.append(f"{fact_text} [{topic_label}]")
+        else:
+            invalid.append(idx)
 
-        if to_delete_ids:
+    if to_delete_ids:
+        conn = _get_memory_conn()
+        try:
             conn.executemany("DELETE FROM facts WHERE id = ?", [(i,) for i in to_delete_ids])
             conn.commit()
-        return removed_texts, invalid
-    finally:
-        conn.close()
+        finally:
+            conn.close()
+    return removed, invalid
 
 
 def clear_user_facts(user_id: str):
     conn = _get_memory_conn()
     try:
         conn.execute("DELETE FROM facts WHERE user_id = ?", (str(user_id),))
+        conn.execute("DELETE FROM topics WHERE user_id = ?", (str(user_id),))
         conn.commit()
     finally:
         conn.close()
 
 
 def _cluster_facts_by_topic(facts_with_emb: list) -> list:
-    """Groups facts into topic clusters via union-find over pairwise cosine
-    similarity at CONSOLIDATION_TOPIC_THRESHOLD. Same same-space-only
+    """Groups facts into clusters via union-find over pairwise cosine
+    similarity at CONSOLIDATION_TOPIC_THRESHOLD. Used both for sub-
+    clustering WITHIN a topic during consolidation, and for grouping
+    pre-topic facts during the one-time migration. Same same-space-only
     reasoning as _is_semantic_duplicate/_find_supersession_candidate — a
     fact with no embedding, or in a different space than its neighbors,
     just ends up alone in its own singleton cluster rather than being
@@ -751,9 +1266,9 @@ async def _llm_consolidate_cluster(facts: list) -> "str | None":
 
 
 def _eligible_clusters_for_consolidation(facts_with_emb: list) -> list:
-    """Shared selection logic for both consolidate_user_facts and
-    preview_consolidation: cluster by topic, keep clusters big enough to be
-    worth merging, largest first, capped at
+    """Shared selection logic for both consolidate_topic and
+    preview_topic_consolidation: cluster by topic-similarity, keep clusters
+    big enough to be worth merging, largest first, capped at
     CONSOLIDATION_MAX_CLUSTERS_PER_PASS — so a preview always shows exactly
     what a real run would touch, and vice versa."""
     clusters = _cluster_facts_by_topic(facts_with_emb)
@@ -764,18 +1279,16 @@ def _eligible_clusters_for_consolidation(facts_with_emb: list) -> list:
     return eligible[:CONSOLIDATION_MAX_CLUSTERS_PER_PASS]
 
 
-async def preview_consolidation(user_id: str, force: bool = False) -> "list[tuple[list[str], str | None]] | None":
-    """Dry-run counterpart to consolidate_user_facts — same clustering and
+async def preview_topic_consolidation(
+    user_id: str, topic_id: int, force: bool = False
+) -> "list[tuple[list[str], str | None]] | None":
+    """Dry-run counterpart to consolidate_topic — same clustering and
     selection, and the same LLM merge call per cluster, but nothing is ever
-    written to the database. Powers `!consolidate preview` so a user can see
-    what a real `!consolidate` would do before committing to it.
-
-    Returns a list of (original_fact_texts, merged_text_or_None) tuples, one
-    per eligible cluster (merged is None if that cluster's LLM call failed —
-    the real run would leave that cluster untouched too), or None if there's
-    nothing eligible to show (mirrors consolidate_user_facts's None return)."""
-    facts_with_emb = get_user_facts_with_embeddings(user_id)
-    if not force and len(facts_with_emb) < CONSOLIDATION_TRIGGER_COUNT:
+    written to the database. Returns a list of (original_fact_texts,
+    merged_text_or_None) tuples, one per eligible cluster, or None if
+    there's nothing eligible to show."""
+    facts_with_emb = _get_topic_facts_with_embeddings(user_id, topic_id)
+    if not force and len(facts_with_emb) < CONSOLIDATION_TOPIC_TRIGGER_COUNT:
         return None
 
     eligible = _eligible_clusters_for_consolidation(facts_with_emb)
@@ -791,20 +1304,18 @@ async def preview_consolidation(user_id: str, force: bool = False) -> "list[tupl
     return results
 
 
-async def consolidate_user_facts(user_id: str, force: bool = False) -> "tuple[int, int] | None":
-    """Sweeps one user's facts for topic clusters and summarizes up to
-    CONSOLIDATION_MAX_CLUSTERS_PER_PASS of the largest clusters (each
+async def consolidate_topic(user_id: str, topic_id: int, force: bool = False) -> "tuple[int, int] | None":
+    """Sweeps a SINGLE topic's facts for sub-clusters and summarizes up to
+    CONSOLIDATION_MAX_CLUSTERS_PER_PASS of the largest ones (each
     CONSOLIDATION_MIN_CLUSTER_SIZE+ facts) into single, shorter entries.
-    This is lossy — minor/redundant details from the cluster may not
-    survive — trading detail for a real reduction in both row count and
-    prompt-injection tokens. Only runs once the user's fact count reaches
-    CONSOLIDATION_TRIGGER_COUNT, unless force=True (used by the manual
-    !consolidate command to bypass that gate and sweep regardless of how
-    many facts are currently stored).
+    This is lossy — minor/redundant details from a cluster may not survive
+    — trading detail for a real reduction in both row count and
+    prompt-injection tokens. Only runs once this topic's fact count reaches
+    CONSOLIDATION_TOPIC_TRIGGER_COUNT, unless force=True.
     Returns (count_before, count_after) if anything was merged, else None."""
-    facts_with_emb = get_user_facts_with_embeddings(user_id)
+    facts_with_emb = _get_topic_facts_with_embeddings(user_id, topic_id)
     before = len(facts_with_emb)
-    if not force and before < CONSOLIDATION_TRIGGER_COUNT:
+    if not force and before < CONSOLIDATION_TOPIC_TRIGGER_COUNT:
         return None
 
     eligible = _eligible_clusters_for_consolidation(facts_with_emb)
@@ -814,23 +1325,68 @@ async def consolidate_user_facts(user_id: str, force: bool = False) -> "tuple[in
         merged = await _llm_consolidate_cluster(texts)
         if not merged:
             continue  # leave this cluster untouched rather than risk losing detail
-        embedding = await _embed_fact(merged)
+        embedding = await _embed_text(merged)
         conn = _get_memory_conn()
         try:
             placeholders = ",".join("?" * len(texts))
             conn.execute(
-                f"DELETE FROM facts WHERE user_id = ? AND fact IN ({placeholders})",
-                (str(user_id), *texts),
+                f"DELETE FROM facts WHERE user_id = ? AND topic_id = ? AND fact IN ({placeholders})",
+                (str(user_id), topic_id, *texts),
             )
             conn.commit()
         finally:
             conn.close()
-        add_user_fact(user_id, merged, embedding)
+        add_user_fact(user_id, merged, topic_id, embedding)
         merged_any = True
 
     if not merged_any:
         return None
-    return before, len(get_user_facts(user_id))
+    return before, _count_topic_facts(user_id, topic_id)
+
+
+async def consolidate_all_topics(user_id: str, force: bool = False) -> list:
+    """Loops consolidate_topic across every one of a user's topics — powers
+    the bare `!consolidate` command. Returns [(topic_label, before, after), ...]
+    for topics where something was actually merged."""
+    results = []
+    for label, _count in get_user_topics(user_id):
+        conn = _get_memory_conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM topics WHERE user_id = ? AND label = ?",
+                (str(user_id), label),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            continue
+        result = await consolidate_topic(user_id, row[0], force=force)
+        if result:
+            before, after = result
+            results.append((label, before, after))
+    return results
+
+
+async def preview_all_topics_consolidation(user_id: str, force: bool = False) -> list:
+    """Loops preview_topic_consolidation across every topic — powers
+    `!consolidate preview`. Returns [(topic_label, cluster_results), ...]
+    for topics with at least one eligible cluster."""
+    results = []
+    for label, _count in get_user_topics(user_id):
+        conn = _get_memory_conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM topics WHERE user_id = ? AND label = ?",
+                (str(user_id), label),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            continue
+        preview = await preview_topic_consolidation(user_id, row[0], force=force)
+        if preview:
+            results.append((label, preview))
+    return results
 
 
 async def get_relevant_facts_block(user_id: str, query: str) -> str:
@@ -838,7 +1394,9 @@ async def get_relevant_facts_block(user_id: str, query: str) -> str:
     prompt. Small fact lists are sent whole; larger ones are trimmed to the
     FACT_RELEVANCE_TOP_K facts most relevant to the current message, so the
     prompt doesn't grow unbounded as a user's fact count climbs toward
-    MAX_FACTS_PER_USER."""
+    MAX_FACTS_PER_USER. Stays flat/cross-topic — this is about relevance to
+    the current message, not about organizing a full listing (that's
+    !recall's job)."""
     facts_with_emb = get_user_facts_with_embeddings(user_id)
     if not facts_with_emb:
         return ""
@@ -846,7 +1404,7 @@ async def get_relevant_facts_block(user_id: str, query: str) -> str:
     if len(facts_with_emb) <= FACT_INJECT_ALWAYS_UNDER:
         chosen = [f for f, _ in facts_with_emb]
     else:
-        query_emb = await _embed_fact(query)
+        query_emb = await _embed_text(query)
         if query_emb is None:
             # Can't rank without a query embedding — most-recent facts are a
             # safer bet than an arbitrary truncation.
@@ -866,6 +1424,155 @@ async def get_relevant_facts_block(user_id: str, query: str) -> str:
     return "\n\nWhat you remember about this user:\n" + "\n".join(f"- {f}" for f in chosen)
 
 
+# --- one-time migration of pre-topic facts ---
+
+async def _llm_name_topic(facts: list) -> "tuple[str, str] | None":
+    """One LLM call to propose a short topic label + one-line summary for a
+    cluster of facts discovered during the one-time migration into topics
+    (these facts predate the topic concept, so nothing tagged them at write
+    time). Returns None (caller falls back to General) if the call fails or
+    comes back unparseable."""
+    facts_block = "\n".join(f"- {f}" for f in facts)
+    prompt = (
+        "These facts were all stored about the same user and turned out to be "
+        "about the same underlying subject. If they're about the user's OWN "
+        "identity, personality, habits, tools they use, or preferences that "
+        "hold true regardless of which project they're discussing (who they "
+        'are, not what they\'re working on), reply with exactly "About You" '
+        "as the label. An opinion, struggle, or preference SPECIFIC to one "
+        'project (e.g. "finds writing a particular character difficult") '
+        "belongs to that project instead, even though it's phrased as being "
+        "about the user. Otherwise, propose a short topic label (2-5 words) "
+        "naming the specific ongoing project, world, or subject they share, "
+        "and a one-sentence summary.\n\n"
+        f"{facts_block}\n\n"
+        'Reply with ONLY a JSON object of this exact shape (no markdown, no '
+        'preamble): {"label": "...", "summary": "..."}'
+    )
+    try:
+        response = await llm.query_llm(
+            {"model": config.MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "stream": False},
+            timeout=30,
+        )
+        raw = response.get("message", {}).get("content", "{}").strip().strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        label = str(parsed.get("label", "")).strip()
+        summary = str(parsed.get("summary", "")).strip()
+        return (label, summary) if label else None
+    except Exception as e:
+        print(f"[MEMORY] Topic naming skipped for one cluster during migration (non-fatal): {e}")
+        return None
+
+
+async def migrate_facts_to_topics():
+    """One-time migration for facts stored before the topics table existed
+    (topic_id IS NULL — this covers both facts from before this feature
+    shipped, and anything that slipped in from the legacy JSON-file
+    migration above). Clusters each affected user's orphaned facts by
+    embedding similarity (reusing the same clustering consolidation already
+    uses) and names each real cluster via one LLM call. Facts that didn't
+    cluster with anything (embedding-similarity singletons) are batched
+    together and classified via the same per-fact LLM judgment
+    reclassify_topic() uses, rather than defaulting straight to General —
+    a single isolated personal fact should still land in "About You", not
+    General, just because nothing else happened to embed near it.
+
+    Call this once at startup (see bot.py's on_ready) — safe to call every
+    time the bot starts: once every fact has a topic_id, the initial query
+    returns nothing and this is a no-op.
+    """
+    conn = _get_memory_conn()
+    try:
+        user_ids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT user_id FROM facts WHERE topic_id IS NULL"
+        ).fetchall()]
+    finally:
+        conn.close()
+
+    if not user_ids:
+        return
+
+    print(f"[MEMORY] Migrating orphaned facts into topics for {len(user_ids)} user(s)...")
+    for user_id in user_ids:
+        conn = _get_memory_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, fact, embedding FROM facts WHERE user_id = ? AND topic_id IS NULL",
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        facts_with_emb = [(fid, fact, _parse_embedding(raw)) for fid, fact, raw in rows]
+        # _cluster_facts_by_topic works on (fact_text, embedding) pairs —
+        # adapt, then map the clustered text back to its fact_id after.
+        clusters = _cluster_facts_by_topic([(fact, emb) for _fid, fact, emb in facts_with_emb])
+        text_to_id = {fact: fid for fid, fact, _emb in facts_with_emb}
+
+        singleton_rows = []  # (fact_id, fact_text) — handled in a batch after real clusters
+        for cluster in clusters:
+            cluster_texts = [f for f, _ in cluster]
+            fact_ids = [text_to_id[f] for f in cluster_texts]
+
+            if len(cluster) < MIGRATION_MIN_CLUSTER_SIZE:
+                # Too small to be worth an LLM call per-cluster — batched
+                # together below via _llm_propose_topics_for_facts instead
+                # of defaulting straight to General. A lone fact with no
+                # embedding neighbor isn't necessarily unrelated to
+                # everything else; it just didn't score close enough to
+                # anything to cluster automatically. This is what keeps a
+                # single isolated personal fact ("uses TickTick") from
+                # defaulting to General instead of "About You" just because
+                # nothing else happened to embed near it.
+                singleton_rows.extend((fid, text) for fid, text in zip(fact_ids, cluster_texts))
+                continue
+
+            named = await _llm_name_topic(cluster_texts)
+            topic_id = await get_or_create_topic(user_id, named[0] if named else DEFAULT_TOPIC_LABEL)
+            if named and named[1]:
+                conn = _get_memory_conn()
+                try:
+                    conn.execute("UPDATE topics SET summary = ? WHERE id = ?", (named[1], topic_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            conn = _get_memory_conn()
+            try:
+                conn.executemany(
+                    "UPDATE facts SET topic_id = ? WHERE id = ?",
+                    [(topic_id, fid) for fid in fact_ids],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        for start in range(0, len(singleton_rows), RECLASSIFY_BATCH_SIZE):
+            batch = singleton_rows[start:start + RECLASSIFY_BATCH_SIZE]
+            existing_labels = [label for label, _c in get_user_topics(user_id)]
+            proposed = await _llm_propose_topics_for_facts([text for _fid, text in batch], existing_labels)
+            if proposed is None:
+                # Call failed — fall back to General rather than leaving
+                # these facts orphaned (topic_id NULL) forever, which would
+                # otherwise make them invisible to !recall entirely.
+                proposed = [DEFAULT_TOPIC_LABEL] * len(batch)
+
+            for (fact_id, _fact_text), label in zip(batch, proposed):
+                topic_id = await get_or_create_topic(user_id, label)
+                conn = _get_memory_conn()
+                try:
+                    conn.execute("UPDATE facts SET topic_id = ? WHERE id = ?", (topic_id, fact_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+
+    print("[MEMORY] Topic migration complete.")
+
+
+# --- extraction ---
+
 async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
     # Deferred import: messaging.py needs get_channel_history/
     # _append_conversation_log from this module at top level, so this module
@@ -878,6 +1585,8 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
 
     existing_facts = get_user_facts(user_id)
     existing_block = "\n".join(f"- {f}" for f in existing_facts) if existing_facts else "(none yet)"
+    existing_topic_labels = [label for label, _count in get_user_topics(user_id)]
+    topics_block = ", ".join(existing_topic_labels) if existing_topic_labels else "(none yet)"
 
     extraction_prompt = (
         "Below is a single message a user sent to a Discord bot, plus the facts "
@@ -889,11 +1598,36 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
         "questions, or temporary details.\n\n"
         "Reply with ONLY a JSON object of this exact shape (no markdown, no "
         "preamble):\n"
-        '{"add": ["new fact 1", ...], "update": [{"replaces": "<verbatim existing '
-        'fact text>", "with": "<revised fact text>"}]}\n'
+        '{"add": [{"fact": "new fact 1", "topic": "short topic label"}, ...], '
+        '"update": [{"replaces": "<verbatim existing fact text>", "with": '
+        '"<revised fact text>"}]}\n'
         "Only use \"update\" when \"replaces\" is copied verbatim from the "
-        "existing facts list below — never paraphrase it. If nothing applies, "
-        'reply with exactly {"add": [], "update": []}\n\n'
+        "existing facts list below — never paraphrase it.\n\n"
+        "For \"topic\": a short label (2-5 words) naming the ongoing subject "
+        "this fact belongs to. Decide which of these three cases applies:\n"
+        "1. The fact is about the user's OWN identity, personality, habits, "
+        "tools they use, or preferences that hold true regardless of which "
+        "project or topic they're discussing (who they are, not what "
+        "they're working on) — use exactly \"About You\" for these, even if "
+        "the message also mentions a project. Don't blend a personal fact "
+        "into a project topic just because both came up in the same "
+        "message.\n"
+        "2. The fact is part of a specific ongoing project, world, or "
+        "subject (a story, a piece of software, a hobby with its own "
+        "recurring details) — if it continues one of the EXISTING TOPICS "
+        "below, reuse that exact label; only propose a new label for a "
+        "genuinely different ongoing subject. This includes an opinion, "
+        "struggle, or preference that's SPECIFIC to that project (e.g. "
+        "\"finds writing a particular character difficult\", \"wants the "
+        "story to end differently\") — these stay with the project's topic "
+        "even though they're phrased as being about the user. \"About You\" "
+        "is only for things true about the user independent of which "
+        "project is being discussed.\n"
+        "3. A true one-off with no lasting category and not about the "
+        'user\'s own identity — use exactly "General".\n\n'
+        f"Existing topics: {topics_block}\n\n"
+        "If nothing applies, reply with exactly "
+        '{"add": [], "update": []}\n\n'
         f"Existing facts:\n{existing_block}\n\nMessage: {user_query}"
     )
     payload = {
@@ -910,7 +1644,11 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             return
-        to_add = [str(f).strip() for f in parsed.get("add", []) if str(f).strip()]
+        to_add = [
+            (str(a.get("fact", "")).strip(), str(a.get("topic", "")).strip() or DEFAULT_TOPIC_LABEL)
+            for a in parsed.get("add", [])
+            if isinstance(a, dict) and str(a.get("fact", "")).strip()
+        ]
         to_update = [
             u for u in parsed.get("update", [])
             if isinstance(u, dict) and str(u.get("replaces", "")).strip() and str(u.get("with", "")).strip()
@@ -922,24 +1660,26 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
     updated_summaries = []
     for u in to_update:
         new_text = str(u["with"]).strip()
-        embedding = await _embed_fact(new_text)
+        embedding = await _embed_text(new_text)
         result = update_user_fact(user_id, str(u["replaces"]), new_text, embedding)
         if result:
             updated_summaries.append(f"{result[0]} → {result[1]}")
         else:
             # "replaces" didn't match anything on file — treat as a fresh
-            # fact rather than silently dropping it.
-            to_add.append(new_text)
+            # fact rather than silently dropping it. No topic hint came with
+            # this one, so it falls back to General; if that's wrong the
+            # next extraction pass or a manual !topics move can fix it.
+            to_add.append((new_text, DEFAULT_TOPIC_LABEL))
 
     added = []
     consolidation_summaries = []
-    consolidation_exhausted = False
+    consolidation_exhausted_topics: "set[int]" = set()
     if to_add:
         existing_for_dedup = get_user_facts_with_embeddings(user_id)
-        for fact in to_add:
+        for fact, proposed_topic in to_add:
             if not fact:
                 continue
-            embedding = await _embed_fact(fact)
+            embedding = await _embed_text(fact)
             if _is_semantic_duplicate(embedding, existing_for_dedup):
                 continue
 
@@ -956,24 +1696,37 @@ async def extract_and_store_facts(user_id: str, user_query: str, channel=None):
                         existing_for_dedup.append((fact, embedding))
                     continue
 
+            topic_id = await get_or_create_topic(user_id, proposed_topic)
+
             # Checked per-fact, not just once before the loop — a single
             # message can extract many new facts at once (a big paste), and
             # a single up-front check would let that whole batch sail past
-            # the cap before the sweep got a second look. consolidation_exhausted
-            # stops it from retrying every remaining iteration once a pass
-            # has genuinely found nothing left to merge — nothing changed,
-            # so an immediate retry can't help; add_user_fact's own trim
-            # remains the safety net for whatever's left in that case.
-            if not consolidation_exhausted and len(existing_for_dedup) >= CONSOLIDATION_TRIGGER_COUNT:
-                result = await consolidate_user_facts(user_id)
-                if result:
-                    before, after = result
-                    consolidation_summaries.append(f"{before} → {after} facts")
-                    existing_for_dedup = get_user_facts_with_embeddings(user_id)
-                else:
-                    consolidation_exhausted = True
+            # the trigger before the sweep got a second look.
+            # consolidation_exhausted_topics stops it from retrying a topic
+            # that's already been swept and found nothing left to merge this
+            # pass — nothing changed, so an immediate retry can't help;
+            # add_user_fact's own global-cap trim remains the safety net for
+            # whatever's left in that case.
+            if topic_id not in consolidation_exhausted_topics:
+                topic_count = _count_topic_facts(user_id, topic_id)
+                if topic_count >= CONSOLIDATION_TOPIC_TRIGGER_COUNT:
+                    result = await consolidate_topic(user_id, topic_id)
+                    if result:
+                        before, after = result
+                        conn = _get_memory_conn()
+                        try:
+                            row = conn.execute(
+                                "SELECT label FROM topics WHERE id = ?", (topic_id,)
+                            ).fetchone()
+                        finally:
+                            conn.close()
+                        topic_label = row[0] if row else "?"
+                        consolidation_summaries.append(f"{topic_label}: {before} → {after} facts")
+                        existing_for_dedup = get_user_facts_with_embeddings(user_id)
+                    else:
+                        consolidation_exhausted_topics.add(topic_id)
 
-            if add_user_fact(user_id, fact, embedding):
+            if add_user_fact(user_id, fact, topic_id, embedding):
                 added.append(fact)
                 existing_for_dedup.append((fact, embedding))
 

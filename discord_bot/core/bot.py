@@ -66,6 +66,7 @@ async def on_ready():
     # Only announce once per process start — on_ready can fire again on reconnects
     if not _startup_notified:
         _startup_notified = True
+        await memory_store.migrate_facts_to_topics()
         if config.ALLOWED_CHANNEL_ID:
             channel = bot.get_channel(config.ALLOWED_CHANNEL_ID)
             if channel:
@@ -192,21 +193,24 @@ async def on_message(message):
 
     if trigger in ("!consolidate preview", "!consolidatepreview", "!consolidate dryrun"):
         async with message.channel.typing():
-            results = await memory_store.preview_consolidation(user_id, force=True)
-        if not results:
+            topic_results = await memory_store.preview_all_topics_consolidation(user_id, force=True)
+        if not topic_results:
             text = "Nothing to consolidate right now — no cluster of related facts is big enough to merge."
         else:
-            parts = [f"🔍 Preview — {len(results)} cluster(s) would be affected by `!consolidate` "
+            parts = [f"🔍 Preview — {sum(len(r) for _l, r in topic_results)} cluster(s) across "
+                     f"{len(topic_results)} topic(s) would be affected by `!consolidate` "
                      "(nothing has been changed):\n"]
-            for i, (originals, merged) in enumerate(results, 1):
-                block = f"**Cluster {i}** ({len(originals)} facts):\n" + "\n".join(
-                    f"- {f}" for f in originals
-                )
-                if merged:
-                    block += f"\n→ would become:\n{merged}"
-                else:
-                    block += "\n→ merge failed, would be left untouched"
-                parts.append(block)
+            for topic_label, results in topic_results:
+                parts.append(f"__**{topic_label}**__")
+                for i, (originals, merged) in enumerate(results, 1):
+                    block = f"**Cluster {i}** ({len(originals)} facts):\n" + "\n".join(
+                        f"- {f}" for f in originals
+                    )
+                    if merged:
+                        block += f"\n→ would become:\n{merged}"
+                    else:
+                        block += "\n→ merge failed, would be left untouched"
+                    parts.append(block)
             parts.append("\nRun `!consolidate` to actually apply this.")
             text = "\n\n".join(parts)
         await messaging.send_chunked(message.channel, text)
@@ -214,13 +218,13 @@ async def on_message(message):
 
     if trigger in ("!consolidate", "!consolidatememory"):
         async with message.channel.typing():
-            result = await memory_store.consolidate_user_facts(user_id, force=True)
-        if result:
-            before, after = result
+            topic_results = await memory_store.consolidate_all_topics(user_id, force=True)
+        if topic_results:
+            lines = [f"- **{label}**: {before} → {after}" for label, before, after in topic_results]
             text = (
-                f"🧠 Consolidated your saved facts: {before} → {after} "
-                "(summarized, so some minor details may have been trimmed). "
-                "Use `!recall` to see the updated list."
+                "🧠 Consolidated your saved facts (summarized, so some minor details may have "
+                "been trimmed):\n" + "\n".join(lines) +
+                "\n\nUse `!recall` to see the updated list."
             )
         else:
             text = "Nothing to consolidate right now — no cluster of related facts was big enough to merge."
@@ -228,16 +232,137 @@ async def on_message(message):
         return
 
     if trigger in ("!recall", "!memory", "!whatdoyouremember"):
-        known_facts = memory_store.get_user_facts(user_id)
-        if known_facts:
-            text = "Here's what I remember about you:\n" + "\n".join(
-                f"{i}. {f}" for i, f in enumerate(known_facts, start=1)
-            )
+        ordered = memory_store.get_user_facts_ordered_with_topics(user_id)
+        if ordered:
+            lines = []
+            current_topic = None
+            for i, (_fact_id, topic_label, fact_text) in enumerate(ordered, start=1):
+                if topic_label != current_topic:
+                    lines.append(f"\n__**{topic_label}**__")
+                    current_topic = topic_label
+                lines.append(f"{i}. {fact_text}")
+            text = "Here's what I remember about you:\n" + "\n".join(lines)
             text += "\n\nUse `!forget <number>` to remove one (e.g. `!forget 1,3,5` or `!forget 2-4` " \
-                    "for several at once), or `!forget` on its own to clear everything."
+                    "for several at once), `!forget` on its own to clear everything, or `!topics` " \
+                    "to manage topics directly."
         else:
             text = "I don't have anything saved about you yet."
         await messaging.send_chunked(message.channel, text)
+        return
+
+    if trigger == "!topics" or trigger.startswith("!topics "):
+        rest = user_query.strip()[len("!topics"):].strip()
+        if not rest or rest.lower() == "list":
+            topics = memory_store.get_user_topics(user_id)
+            if topics:
+                text = "Your topics:\n" + "\n".join(f"- **{label}** ({count})" for label, count in topics)
+                text += (
+                    "\n\nUse `!topics rename <old> | <new>`, `!topics merge <keep> | <remove>` "
+                    "(separate the two names with a `|`), `!topics reclassify <topic>` if a "
+                    "topic ended up too broad, or `!topics move <number> | <topic>` to move one "
+                    "fact by its `!recall` number."
+                )
+            else:
+                text = "You don't have any topics yet — I'll create them automatically as I learn things about you."
+            await messaging.send_chunked(message.channel, text)
+        elif rest.lower().startswith("rename "):
+            spec = rest[len("rename "):].strip()
+            if "|" not in spec:
+                await messaging.send_chunked(
+                    message.channel,
+                    "Usage: `!topics rename <old name> | <new name>` (separate the two with a `|`)."
+                )
+            else:
+                old_label, new_label = (p.strip() for p in spec.split("|", 1))
+                result = await memory_store.rename_topic(user_id, old_label, new_label)
+                if result:
+                    await messaging.send_chunked(message.channel, f"✏️ Renamed **{result[0]}** → **{result[1]}**.")
+                else:
+                    await messaging.send_chunked(
+                        message.channel,
+                        f"⚠️ Couldn't find a topic called \"{old_label}\", or \"{new_label}\" is "
+                        "already a different existing topic (use `!topics merge` to combine two)."
+                    )
+        elif rest.lower().startswith("merge "):
+            spec = rest[len("merge "):].strip()
+            if "|" not in spec:
+                await messaging.send_chunked(
+                    message.channel,
+                    "Usage: `!topics merge <topic to keep> | <topic to remove>` (separate the two with a `|`)."
+                )
+            else:
+                keep_label, remove_label = (p.strip() for p in spec.split("|", 1))
+                result = memory_store.merge_topics(user_id, keep_label, remove_label)
+                if result:
+                    kept, removed, moved = result
+                    await messaging.send_chunked(
+                        message.channel,
+                        f"🔀 Merged **{removed}** into **{kept}** ({moved} fact(s) moved)."
+                    )
+                else:
+                    await messaging.send_chunked(
+                        message.channel,
+                        f"⚠️ Couldn't merge — check that both \"{keep_label}\" and \"{remove_label}\" "
+                        "are existing, different topics (see `!topics` for the current list)."
+                    )
+        elif rest.lower().startswith("reclassify "):
+            topic_label = rest[len("reclassify "):].strip()
+            async with message.channel.typing():
+                result = await memory_store.reclassify_topic(user_id, topic_label)
+            if result:
+                total, moved = result
+                if moved:
+                    await messaging.send_chunked(
+                        message.channel,
+                        f"🔀 Reclassified **{topic_label}**: moved {moved} of {total} fact(s) to a "
+                        "better-fitting topic. Use `!topics` to see the result."
+                    )
+                else:
+                    await messaging.send_chunked(
+                        message.channel,
+                        f"Checked **{topic_label}**'s {total} fact(s) — everything already looked "
+                        "correctly filed, nothing moved."
+                    )
+            else:
+                await messaging.send_chunked(
+                    message.channel,
+                    f"⚠️ Couldn't find a topic called \"{topic_label}\" with any facts in it."
+                )
+        elif rest.lower().startswith("move "):
+            spec = rest[len("move "):].strip()
+            if "|" not in spec:
+                await messaging.send_chunked(
+                    message.channel,
+                    "Usage: `!topics move <number> | <topic name>` (use the number from `!recall`)."
+                )
+            else:
+                num_part, topic_part = (p.strip() for p in spec.split("|", 1))
+                if not num_part.isdigit():
+                    await messaging.send_chunked(
+                        message.channel,
+                        "The part before `|` must be the fact's number from `!recall`."
+                    )
+                else:
+                    result = await memory_store.move_fact_to_topic(user_id, int(num_part), topic_part)
+                    if result:
+                        fact_text, resolved_label = result
+                        await messaging.send_chunked(
+                            message.channel, f"📌 Moved to **{resolved_label}**: {fact_text}"
+                        )
+                    else:
+                        await messaging.send_chunked(
+                            message.channel,
+                            f"⚠️ No fact at position {num_part} — check `!recall` for current numbers."
+                        )
+        else:
+            await messaging.send_chunked(
+                message.channel,
+                "Usage: `!topics` (list), `!topics rename <old> | <new>`, "
+                "`!topics merge <keep> | <remove>`, `!topics reclassify <topic>` "
+                "(re-sorts a topic's facts if it ended up too broad), or "
+                "`!topics move <number> | <topic>` (moves one fact by its "
+                "`!recall` number)."
+            )
         return
     if trigger in ("!forget", "!forgetme", "!clearmemory"):
         memory_store.clear_user_facts(user_id)
@@ -313,10 +438,11 @@ async def on_message(message):
         "For an explicit date/time, build target_time_iso from the 'Current date and time' below, and "
         "never guess the year if the user didn't give one.\n\n"
         "If the user asks what you remember, or how to clear it, tell them they can type "
-        "!recall to see a numbered list of saved facts, !forget <number> to remove just one "
+        "!recall to see saved facts grouped by topic, !forget <number> to remove just one "
         "(!forget 1,3,5 or !forget 2-4 to remove several at once), "
         "!forget on its own to clear everything, "
-        "!consolidate to manually summarize related facts into shorter entries right away "
+        "!topics to list topics or !topics rename/merge to manage them directly, "
+        "!consolidate to manually summarize related facts within a topic into shorter entries right away "
         "(this is lossy — minor details may be trimmed to actually save tokens), "
         "or !consolidate preview to see what !consolidate would do first without changing anything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
