@@ -77,6 +77,17 @@ async def on_ready():
 async def on_message(message):
     if message.author == bot.user:
         return
+    # System notifications — most commonly the "X started a thread: Y"
+    # message Discord fires when a thread is created directly off the
+    # channel (rather than from an existing message) — arrive through
+    # on_message too, with message.content mirroring the thread name/
+    # system text rather than anything the user actually typed to amoai.
+    # Without this check that text sails straight into the tool-calling
+    # loop below as if it were a real prompt. discord.MessageType.reply is
+    # explicitly kept alongside .default since a genuine reply is still a
+    # normal user message, just with a reference attached.
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+        return
     if config.ALLOWED_CHANNEL_ID:
         in_allowed_channel = message.channel.id == config.ALLOWED_CHANNEL_ID
         in_allowed_thread = (
