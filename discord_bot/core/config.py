@@ -14,7 +14,8 @@ from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
 
-MODEL_NAME = "gemma4:cloud"
+MODEL_NAME = os.getenv("MODEL_NAME") or "gemma4:cloud"
+VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME") or "gemma4:cloud"
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

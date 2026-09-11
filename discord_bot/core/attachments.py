@@ -229,7 +229,7 @@ async def describe_images_for_tools(images_b64: "list[str]", user_query: str, ch
         or "Describe this image in detail, including any visible text, numbers, or data (OCR anything readable)."
     )
     vision_payload = {
-        "model": config.MODEL_NAME,
+        "model": config.VISION_MODEL_NAME,
         "messages": [
             {
                 "role": "system",
