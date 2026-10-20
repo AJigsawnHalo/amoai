@@ -1,10 +1,10 @@
 """
 textfmt.py — output sanitizers for Discord.
 
-strip_tables(): Discord doesn't render markdown tables, so any table the model
-emits shows up as raw pipes. This rewrites each table into a bold-title +
-bullet list, which Discord renders fine. It's idempotent and leaves
-non-table text (and fenced code blocks) untouched.
+strip_tables(): Discord doesn't render markdown tables or HTML, so tables show
+up as raw pipes and <br> tags show up literally. This rewrites each table into
+a bold-title + bullet list and turns <br> tags into real newlines. It's
+idempotent and leaves fenced code blocks untouched.
 """
 import re
 
@@ -42,8 +42,31 @@ def _convert_table(rows: list[list[str]]) -> str:
     return "\n".join(out).rstrip()
 
 
+_BR_RE = re.compile(r"[ \t]*<br\s*/?>[ \t]*", re.IGNORECASE)
+
+
+def _strip_br(text: str) -> str:
+    """<br> -> newline, outside fenced code blocks."""
+    if "<" not in text:
+        return text
+    out, in_code = [], False
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+        else:
+            out.append(line if in_code else _BR_RE.sub("\n", line))
+    return "\n".join(out)
+
+
 def strip_tables(text: str) -> str:
-    if not text or "|" not in text:
+    if not text:
+        return text
+    return _strip_br(_strip_tables(text))
+
+
+def _strip_tables(text: str) -> str:
+    if "|" not in text:
         return text
 
     lines = text.split("\n")
@@ -99,8 +122,11 @@ Pick based on your GPU budget.
 | code | block |
 ```
 """
+    sample += "\nA <br>• one <br/>• two<BR />• three\n```\nkeep <br> in code\n```\n"
     out = strip_tables(sample)
     print(out)
+    assert "<br>" not in out.split("```")[0]
+    assert "keep <br> in code" in out
     assert "|---" not in out.split("```")[0]
     assert strip_tables(out) == out  # idempotent
     print("\nOK")

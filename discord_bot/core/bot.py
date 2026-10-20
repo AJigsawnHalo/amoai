@@ -463,6 +463,7 @@ async def on_message(message):
         "When a topic calls for a comparison, write each item as a bold name followed by short bullet lines, "
         "for example:\n**Item A**\n- Speed: fast\n- Cost: low\n"
         "Never use markdown tables or pipe characters (|) for layout — Discord does not render them. "
+        "Never use HTML tags such as <br>; use actual new lines instead. "
         r"If you need to represent a matrix, use a plain text grid inside a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
         f"\n\nCurrent date and time (GMT+8): {datetime.now(BOT_TIMEZONE).strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
         + ("\n\nThe user attached one or more images to this message. You don't see the "
