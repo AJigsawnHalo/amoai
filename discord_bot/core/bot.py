@@ -41,6 +41,9 @@ from tools.reminder_tool import BOT_TIMEZONE
 
 ACTIVE_TASKS: "dict[str, asyncio.Task]" = {}
 
+CLEAR_DEFAULT_COUNT = 30   # messages removed by a bare !clear
+CLEAR_MAX_COUNT = 100      # upper bound on !clear <n>, to avoid accidental mass-deletes
+
 _startup_notified = False
 
 
@@ -157,6 +160,49 @@ async def on_message(message):
             await messaging.send_chunked(message.channel, "🛑 Stopping...")
         else:
             await messaging.send_chunked(message.channel, "Nothing's running right now.")
+        return
+
+    if trigger == "!clear" or trigger.startswith("!clear "):
+        # Owner-only: this permanently deletes messages from the channel, so
+        # like !allowlist it's gated on the owner rather than channel membership.
+        if user_id != config.DISCORD_USER_ID:
+            await messaging.send_chunked(message.channel, "🔒 Only the bot owner can clear messages.")
+            return
+
+        arg = trigger[len("!clear"):].strip()
+        if not arg:
+            count = CLEAR_DEFAULT_COUNT
+        elif arg.isdigit() and int(arg) >= 1:
+            count = min(int(arg), CLEAR_MAX_COUNT)
+        else:
+            await messaging.send_chunked(
+                message.channel,
+                f"Usage: `!clear` (last {CLEAR_DEFAULT_COUNT} messages) or `!clear <number>` "
+                f"(1-{CLEAR_MAX_COUNT})."
+            )
+            return
+
+        if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+            await messaging.send_chunked(message.channel, "⚠️ I can only clear messages in a server channel or thread.")
+            return
+
+        try:
+            # +1 so the "!clear" message itself doesn't count against the number requested.
+            deleted = await message.channel.purge(limit=count + 1)
+        except discord.Forbidden:
+            await messaging.send_chunked(
+                message.channel,
+                "⚠️ I don't have permission to delete messages here — I need the **Manage Messages** "
+                "permission (and **Read Message History**) in this channel."
+            )
+            return
+        except discord.HTTPException as e:
+            await messaging.send_chunked(message.channel, f"⚠️ Failed to clear messages: {e}")
+            return
+
+        # The command message is part of `deleted`; report only what was cleared besides it.
+        cleared = max(len(deleted) - 1, 0)
+        await message.channel.send(f"🧹 Cleared {cleared} message(s).", delete_after=5)
         return
 
     if trigger in ("!briefing on", "!briefing off", "!briefing status"):
