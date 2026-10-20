@@ -36,6 +36,7 @@ import messaging
 import webhook
 import scheduler
 import attachments
+import textfmt
 from tools.reminder_tool import BOT_TIMEZONE
 
 ACTIVE_TASKS: "dict[str, asyncio.Task]" = {}
@@ -458,7 +459,11 @@ async def on_message(message):
         "or !consolidate preview to see what !consolidate would do first without changing anything. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
-        r"You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. If you need to represent a matrix or a table, use a plain text grid or a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
+        r" You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. "
+        "When a topic calls for a comparison, write each item as a bold name followed by short bullet lines, "
+        "for example:\n**Item A**\n- Speed: fast\n- Cost: low\n"
+        "Never use markdown tables or pipe characters (|) for layout — Discord does not render them. "
+        r"If you need to represent a matrix, use a plain text grid inside a markdown code block. Do not use `\begin`, `\end`, or `\bmatrix` commands."
         f"\n\nCurrent date and time (GMT+8): {datetime.now(BOT_TIMEZONE).strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
         + ("\n\nThe user attached one or more images to this message. You don't see the "
            "raw image — a separate vision pass already described/OCR'd it, and that "
@@ -558,7 +563,7 @@ async def on_message(message):
                     loop_count += 1
 
                 else:
-                    response_text = (
+                    response_text = textfmt.strip_tables(
                         message_data.get("content")
                         or (f"✅ {last_tool_output}" if last_tool_output else None)
                         or "I processed that, but had nothing to say."
@@ -582,6 +587,7 @@ async def on_message(message):
                     )
                 except Exception:
                     summary_text = "⚠️ I tried processing that request but hit my execution limit. Let's try something else!"
+                summary_text = textfmt.strip_tables(summary_text)
                 await messaging.send_chunked(message.channel, summary_text)
                 memory_store.record_turn(message.channel, user_query, summary_text)
                 asyncio.create_task(messaging.maybe_suggest_thread(message, memory_store._get_conversation_message_count(message.channel.id)))
