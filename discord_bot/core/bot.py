@@ -38,6 +38,7 @@ import scheduler
 import attachments
 import textfmt
 from tools.reminder_tool import BOT_TIMEZONE
+from tools import web_search as web_search_tool
 
 ACTIVE_TASKS: "dict[str, asyncio.Task]" = {}
 
@@ -557,6 +558,8 @@ async def on_message(message):
         "!consolidate to manually summarize related facts within a topic into shorter entries right away "
         "(this is lossy — minor details may be trimmed to actually save tokens), "
         "or !consolidate preview to see what !consolidate would do first without changing anything. "
+        "When you use web_search, the bot automatically appends a Sources list of the result links to your "
+        "reply, so don't list or paste the result URLs yourself. "
         "If the user asks how to change which model you run on, tell them that inside a thread the bot owner "
         "can type !model to see the thread's model, !model <name> to switch just that thread, or !model reset "
         "to go back to the default; the main channel always uses the default model. "
@@ -610,6 +613,10 @@ async def on_message(message):
     active_model = memory_store.get_channel_model(message.channel)
     fallback_model = config.MODEL_NAME if active_model != config.MODEL_NAME else None
 
+    # (title, url) pairs from every web_search call this turn; appended to the
+    # reply as a "Sources" list with the links wrapped in <> so they don't embed.
+    search_sources = []
+
     try:
         async with message.channel.typing():
             while running and loop_count < max_loops:
@@ -661,6 +668,8 @@ async def on_message(message):
 
                         tool_registry.log_tool_call(name, args, output, source="llm")
                         last_tool_output = output
+                        if name == "web_search":
+                            web_search_tool._collect_sources(str(output), search_sources)
 
                         tool_message = {
                             "role": "tool",
@@ -680,7 +689,11 @@ async def on_message(message):
                         or (f"✅ {last_tool_output}" if last_tool_output else None)
                         or "I processed that, but had nothing to say."
                     )
-                    await messaging.send_chunked(message.channel, response_text)
+                    # The sources list is for the reader only: it's left out of the
+                    # saved history so the model doesn't start imitating/duplicating it.
+                    sources_footer = web_search_tool._format_sources(search_sources)
+                    display_text = f"{response_text}\n\n{sources_footer}" if sources_footer else response_text
+                    await messaging.send_chunked(message.channel, display_text)
                     memory_store.record_turn(message.channel, user_query, response_text)
                     asyncio.create_task(messaging.maybe_suggest_thread(message, memory_store._get_conversation_message_count(message.channel.id)))
                     asyncio.create_task(memory_store.extract_and_store_facts(user_id, user_query, message.channel))
@@ -702,7 +715,9 @@ async def on_message(message):
                 except Exception:
                     summary_text = "⚠️ I tried processing that request but hit my execution limit. Let's try something else!"
                 summary_text = textfmt.strip_tables(summary_text)
-                await messaging.send_chunked(message.channel, summary_text)
+                sources_footer = web_search_tool._format_sources(search_sources)
+                display_text = f"{summary_text}\n\n{sources_footer}" if sources_footer else summary_text
+                await messaging.send_chunked(message.channel, display_text)
                 memory_store.record_turn(message.channel, user_query, summary_text)
                 asyncio.create_task(messaging.maybe_suggest_thread(message, memory_store._get_conversation_message_count(message.channel.id)))
                 asyncio.create_task(memory_store.extract_and_store_facts(user_id, user_query, message.channel))
