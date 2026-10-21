@@ -45,6 +45,26 @@ ACTIVE_TASKS: "dict[str, asyncio.Task]" = {}
 CLEAR_DEFAULT_COUNT = 30   # messages removed by a bare !clear
 CLEAR_MAX_COUNT = 100      # upper bound on !clear <n>, to avoid accidental mass-deletes
 
+# Shown by !help. Keep in sync when adding, removing or renaming a ! command.
+HELP_TEXT = (
+    "**Amoai commands** (🔒 = owner only)\n"
+    "\n"
+    "__**Control**__\n"
+    "- `!stop` (also `!cancel`, `!halt`) — stop whatever I'm running\n"
+    f"- `!clear [n]` 🔒 — delete the last n messages in this channel (default {CLEAR_DEFAULT_COUNT}, max {CLEAR_MAX_COUNT})\n"
+    "- `!model` 🔒 — in a thread, show its model; `!model <name>` sets it, `!model reset` goes back to the default\n"
+    "- `!briefing on` / `off` / `status` — turn the morning briefing on or off, or check it\n"
+    "- `!allowlist` 🔒 — show the containers I can restart; `!allowlist add <container>` / `remove <container>`\n"
+    "\n"
+    "__**Memory**__\n"
+    "- `!recall` (also `!memory`, `!whatdoyouremember`) — show everything I remember about you, numbered and grouped by topic\n"
+    "- `!forget <number>` — remove facts by number (`1,3,5` or `2-4`) or by text; `!forget` on its own clears everything (also `!forgetme`, `!clearmemory`)\n"
+    "- `!topics` — list your topics; `!topics rename <old> | <new>`, `merge <keep> | <remove>`, `reclassify <topic>`, `move <number> | <topic>`\n"
+    "- `!consolidate` (also `!consolidatememory`) — merge clusters of related facts; `!consolidate preview` (also `!consolidatepreview`, `!consolidate dryrun`) shows what would change first\n"
+    "\n"
+    "- `!help` (also `!commands`) — show this list"
+)
+
 _startup_notified = False
 
 
@@ -161,6 +181,10 @@ async def on_message(message):
             await messaging.send_chunked(message.channel, "🛑 Stopping...")
         else:
             await messaging.send_chunked(message.channel, "Nothing's running right now.")
+        return
+
+    if trigger in ("!help", "!commands"):
+        await messaging.send_chunked(message.channel, HELP_TEXT)
         return
 
     if trigger == "!clear" or trigger.startswith("!clear "):
@@ -514,10 +538,13 @@ async def on_message(message):
 
     system_prompt = (
         "Your name is Amoai. Your nickname is Ai. Your name is based on 'Almond Eye' the legendary racehorse and the Uma Musume. "
-        "Excelling at both academics and athletics, you also have the makings of a star; you are the ultimate model student, flawless in all aspects. You were only able to achieve this, however, thanks to your defining trait of absolutely hating to lose, a trait which must be prefaced with no fewer than nine 'really's."
-        "You are competitive to a point of perfectionism, and the one flaw in your shining qualities is that you often push yourself beyond your body's limits."
-        "You answer quick and concise responses but still show a bit of your personality through."
+        "Excelling at both academics and athletics, you also have the makings of a star; you are the ultimate model student, flawless in all aspects. You were only able to achieve this, however, thanks to your defining trait of absolutely hating to lose, a trait which must be prefaced with no fewer than nine 'really's. "
+        "You are competitive to a point of perfectionism, and the one flaw in your shining qualities is that you often push yourself beyond your body's limits. "
+        "You answer quick and concise responses but still show a bit of your personality through. "
         "You are a helpful tech-support companion. You manage the server 'hiryu'. Always respond in a friendly tone. "
+        "The character description above is about YOU, Amoai, the assistant — it is never information about the user. "
+        "Don't attribute your own traits (competitiveness, perfectionism, hating to lose, pushing past your limits) to the user; "
+        "what you know about the user comes only from the saved user facts at the end of this prompt and what they say in the conversation. "
         "You have access to tools. Always evaluate if a user's request can be answered by using a tool before responding with text. If no tool is needed, respond as yourself. If the user asks a follow up question after you used a tool, always evaluate if you need to use a tool to correctly answer."
         "If you are unsure whether a tool applies, or you're missing information a tool would need, "
         "ask the user a clarifying question instead of guessing or answering without checking. "
@@ -560,6 +587,7 @@ async def on_message(message):
         "or !consolidate preview to see what !consolidate would do first without changing anything. "
         "When you use web_search, the bot automatically appends a Sources list of the result links to your "
         "reply, so don't list or paste the result URLs yourself. "
+        "If the user asks what commands you have, tell them to type !help. "
         "If the user asks how to change which model you run on, tell them that inside a thread the bot owner "
         "can type !model to see the thread's model, !model <name> to switch just that thread, or !model reset "
         "to go back to the default; the main channel always uses the default model. "

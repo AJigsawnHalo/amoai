@@ -116,12 +116,18 @@ FACT_DEDUP_THRESHOLD = 0.93
 # fact, not silently duplicated because it landed in a different bucket.
 FACT_SUPERSESSION_BAND_MIN = 0.78
 # Fact lists at or under this size are injected into the system prompt
-# whole — not worth the embedding/ranking overhead. Above it, only the
-# FACT_RELEVANCE_TOP_K most relevant facts to the current message go in, so
+# whole — not worth the embedding/ranking overhead. Above it, the user's
+# "About You" facts (name, job, location, habits...) are always included —
+# they're the facts a relevance ranking is worst at surfacing, since a
+# message like "who am I" is close to none of them — and the
+# FACT_RELEVANCE_TOP_K most relevant of the REST go in on top of that, so
 # the prompt doesn't grow unbounded as a user's fact count approaches
 # MAX_FACTS_PER_USER.
-FACT_INJECT_ALWAYS_UNDER = 8
-FACT_RELEVANCE_TOP_K = 8
+FACT_INJECT_ALWAYS_UNDER = 20
+FACT_RELEVANCE_TOP_K = 20
+# Upper bound on how many "About You" facts are always included (the most
+# recent ones win); any beyond this compete in the relevance ranking instead.
+FACT_ABOUT_YOU_MAX = 30
 
 # Two facts whose embeddings score at or above this are treated as "about
 # the same underlying topic" for consolidation purposes — deliberately a
@@ -930,6 +936,23 @@ def get_user_facts_with_embeddings(user_id: str) -> list:
     return [(fact, _parse_embedding(raw)) for fact, raw in rows]
 
 
+def get_user_facts_with_embeddings_and_topics(user_id: str) -> list:
+    """Like get_user_facts_with_embeddings, but also returns each fact's topic
+    label: [(fact, (space, vector) | None, topic_label | None), ...] in
+    creation order. topic_label is None for a fact not yet assigned to a topic."""
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT f.fact, f.embedding, t.label FROM facts f "
+            "LEFT JOIN topics t ON f.topic_id = t.id "
+            "WHERE f.user_id = ? ORDER BY f.id ASC",
+            (str(user_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [(fact, _parse_embedding(raw), label) for fact, raw, label in rows]
+
+
 def get_user_facts_ordered_with_topics(user_id: str) -> list:
     """Returns [(fact_id, topic_label, fact_text), ...] in the SAME stable
     order !recall displays and !forget's numeric positions refer to —
@@ -1458,38 +1481,56 @@ async def preview_all_topics_consolidation(user_id: str, force: bool = False) ->
 
 
 async def get_relevant_facts_block(user_id: str, query: str) -> str:
-    """Builds the "What you remember about this user" block for the system
-    prompt. Small fact lists are sent whole; larger ones are trimmed to the
-    FACT_RELEVANCE_TOP_K facts most relevant to the current message, so the
-    prompt doesn't grow unbounded as a user's fact count climbs toward
-    MAX_FACTS_PER_USER. Stays flat/cross-topic — this is about relevance to
-    the current message, not about organizing a full listing (that's
-    !recall's job)."""
-    facts_with_emb = get_user_facts_with_embeddings(user_id)
-    if not facts_with_emb:
+    """Builds the saved-facts block for the system prompt. Small fact lists
+    are sent whole. Larger ones send the user's "About You" facts (always —
+    see FACT_ABOUT_YOU_MAX) plus the FACT_RELEVANCE_TOP_K facts from the rest
+    that are most relevant to the current message, so the prompt doesn't grow
+    unbounded as a user's fact count climbs toward MAX_FACTS_PER_USER. Stays
+    flat/cross-topic — this is about relevance to the current message, not
+    about organizing a full listing (that's !recall's job)."""
+    rows = get_user_facts_with_embeddings_and_topics(user_id)
+    if not rows:
         return ""
 
-    if len(facts_with_emb) <= FACT_INJECT_ALWAYS_UNDER:
-        chosen = [f for f, _ in facts_with_emb]
+    if len(rows) <= FACT_INJECT_ALWAYS_UNDER:
+        chosen = [fact for fact, _emb, _topic in rows]
     else:
-        query_emb = await _embed_text(query)
-        if query_emb is None:
-            # Can't rank without a query embedding — most-recent facts are a
-            # safer bet than an arbitrary truncation.
-            chosen = [f for f, _ in facts_with_emb[-FACT_RELEVANCE_TOP_K:]]
-        else:
-            q_space, q_vector = query_emb
-            scored = []
-            for fact, emb in facts_with_emb:
-                if emb and emb[0] == q_space:
-                    score = embeddings.cosine_similarity(q_vector, emb[1])
-                else:
-                    score = 1.0  # no comparable embedding — never silently hide it
-                scored.append((score, fact))
-            scored.sort(key=lambda pair: pair[0], reverse=True)
-            chosen = [fact for _, fact in scored[:FACT_RELEVANCE_TOP_K]]
+        about_you = [
+            fact for fact, _emb, topic in rows
+            if topic and topic.lower() == USER_TOPIC_LABEL.lower()
+        ]
+        pinned = about_you[-FACT_ABOUT_YOU_MAX:]
+        pinned_set = set(pinned)
+        pool = [(fact, emb) for fact, emb, _topic in rows if fact not in pinned_set]
 
-    return "\n\nWhat you remember about this user:\n" + "\n".join(f"- {f}" for f in chosen)
+        if len(pool) <= FACT_INJECT_ALWAYS_UNDER:
+            ranked = [fact for fact, _ in pool]
+        else:
+            query_emb = await _embed_text(query)
+            if query_emb is None:
+                # Can't rank without a query embedding — most-recent facts are a
+                # safer bet than an arbitrary truncation.
+                ranked = [fact for fact, _ in pool[-FACT_RELEVANCE_TOP_K:]]
+            else:
+                q_space, q_vector = query_emb
+                scored = []
+                for fact, emb in pool:
+                    if emb and emb[0] == q_space:
+                        score = embeddings.cosine_similarity(q_vector, emb[1])
+                    else:
+                        score = 1.0  # no comparable embedding — never silently hide it
+                    scored.append((score, fact))
+                scored.sort(key=lambda pair: pair[0], reverse=True)
+                ranked = [fact for _, fact in scored[:FACT_RELEVANCE_TOP_K]]
+        chosen = pinned + ranked
+
+    return (
+        "\n\nSaved facts about the USER — the person you're talking to. These describe them, "
+        "not you (Amoai). If they ask who they are or what you know about them, answer only "
+        "from these facts and the conversation, never from your own character, and say so if "
+        "something isn't covered here:\n"
+        + "\n".join(f"- {f}" for f in chosen)
+    )
 
 
 # --- one-time migration of pre-topic facts ---
