@@ -652,7 +652,7 @@ async def on_message(message):
                                     f"⚠️ About to run **{name.replace('_', ' ')}** with `{args}`."
                                 )
                                 if approved:
-                                    await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
+                                    await message.channel.send(f"-# 🔍 {name.replace('_', ' ')}...")
                                     try:
                                         output = await asyncio.to_thread(tool_registry.TOOL_REGISTRY[name], **args)
                                     except Exception as tool_err:
@@ -660,7 +660,7 @@ async def on_message(message):
                                 else:
                                     output = "Action cancelled by the user."
                             else:
-                                await message.channel.send(f"🔍 {name.replace('_', ' ')}...")
+                                await message.channel.send(f"-# 🔍 {name.replace('_', ' ')}...")
                                 try:
                                     output = await asyncio.to_thread(tool_registry.TOOL_REGISTRY[name], **args)
                                 except Exception as tool_err:
