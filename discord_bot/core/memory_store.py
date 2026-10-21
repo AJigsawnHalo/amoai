@@ -1575,6 +1575,59 @@ async def _llm_name_topic(facts: list) -> "tuple[str, str] | None":
         return None
 
 
+BACKFILL_MAX_CONSECUTIVE_FAILURES = 3
+
+
+async def backfill_missing_fact_embeddings() -> int:
+    """Embeds every fact that has no stored embedding (facts from before
+    embeddings existed, or saved while the embedding API was unavailable).
+    Without one, a fact can't be ranked against a message — retrieval treats
+    it as "always relevant", so a pile of them crowds out everything else —
+    and it's also invisible to duplicate detection and consolidation
+    clustering.
+
+    Uses Gemini only (not the local fallback) so every backfilled vector is in
+    the same space the queries are embedded in. Safe to call on every start:
+    once nothing is missing it's a no-op. Gives up after a few consecutive
+    failures (API down / no key) and tries again next start. Returns how many
+    facts were embedded."""
+    conn = _get_memory_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, fact FROM facts WHERE embedding IS NULL OR embedding = '' ORDER BY id ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return 0
+
+    print(f"[MEMORY] Backfilling embeddings for {len(rows)} fact(s)...")
+    done = failures = 0
+    for fact_id, fact in rows:
+        vector = await embeddings.get_embedding(fact)
+        if vector is None:
+            failures += 1
+            if failures >= BACKFILL_MAX_CONSECUTIVE_FAILURES:
+                print("[MEMORY] Embedding backfill stopping early — embedding API unavailable; will retry next start.")
+                break
+            continue
+        failures = 0
+        conn = _get_memory_conn()
+        try:
+            # Only fill a still-empty slot: never overwrite an embedding written
+            # by a fact update that raced with this loop.
+            cur = conn.execute(
+                "UPDATE facts SET embedding = ? WHERE id = ? AND (embedding IS NULL OR embedding = '')",
+                (_encode_embedding(("gemini", vector)), fact_id),
+            )
+            conn.commit()
+            done += cur.rowcount
+        finally:
+            conn.close()
+    print(f"[MEMORY] Embedding backfill done: {done}/{len(rows)} fact(s) embedded.")
+    return done
+
+
 async def migrate_facts_to_topics():
     """One-time migration for facts stored before the topics table existed
     (topic_id IS NULL — this covers both facts from before this feature

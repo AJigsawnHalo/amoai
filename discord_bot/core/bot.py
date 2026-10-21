@@ -92,6 +92,8 @@ async def on_ready():
     if not _startup_notified:
         _startup_notified = True
         await memory_store.migrate_facts_to_topics()
+        # Runs in the background so a slow/unavailable embedding API can't delay startup.
+        asyncio.create_task(memory_store.backfill_missing_fact_embeddings())
         if config.ALLOWED_CHANNEL_ID:
             channel = bot.get_channel(config.ALLOWED_CHANNEL_ID)
             if channel:
