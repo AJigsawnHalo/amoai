@@ -295,6 +295,15 @@ def _append_conversation_log(channel_id, role: str, content: str):
                 """,
                 (str(channel_id), overflow),
             )
+            # Once the log is full the count stops growing, so the thread-suggestion
+            # cooldown ("count - last_suggested_at >= N") could never be met again.
+            # Shift last_suggested_at down by however many rows were trimmed so it
+            # keeps measuring "messages since the last suggestion".
+            conn.execute(
+                "UPDATE thread_suggestion_state "
+                "SET last_suggested_at = MAX(last_suggested_at - ?, 0) WHERE channel_id = ?",
+                (overflow, str(channel_id)),
+            )
             conn.commit()
     finally:
         conn.close()
