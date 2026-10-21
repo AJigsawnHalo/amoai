@@ -12,6 +12,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -115,7 +116,37 @@ async def query_ollama(payload: dict, timeout: int = 90, retries: int = 2) -> di
     raise last_err
 
 
-async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
+async def ollama_model_known(name: str) -> "bool | None":
+    """Checks `name` against the Ollama instance's model list (/api/tags on the
+    same host as OLLAMA_API). Returns True/False, or None if the list couldn't
+    be fetched. Cloud models (e.g. "gemma4:cloud") may not appear in this list
+    even though they work, so callers should treat False as a warning, not a
+    hard failure."""
+    parts = urlsplit(config.OLLAMA_API)
+    tags_url = f"{parts.scheme}://{parts.netloc}/api/tags"
+    try:
+        session = await get_session()
+        async with session.get(tags_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except Exception:
+        return None
+
+    installed = {m.get("name") or m.get("model") for m in data.get("models", []) if isinstance(m, dict)}
+    installed.discard(None)
+    # Ollama treats a bare name as ":latest".
+    wanted = name if ":" in name else f"{name}:latest"
+    return name in installed or wanted in installed
+
+
+async def query_llm(payload: dict, timeout: int = 90, channel=None, fallback_model: "str | None" = None) -> dict:
+    """Sends the payload to Ollama; on failure, falls back in order:
+    1. `fallback_model` (if given and different from the payload's model) — used
+       by per-thread model overrides so a failing thread model drops back to the
+       main model first.
+    2. config.LOCAL_FALLBACK_MODEL — the existing last resort.
+    """
     global LAST_CHAT_BACKEND
     # Deferred import: messaging.py needs memory_store.py, which needs this
     # function (llm.query_llm) — importing messaging at module load time
@@ -123,18 +154,41 @@ async def query_llm(payload: dict, timeout: int = 90, channel=None) -> dict:
     # run at import), messaging.py is fully loaded, so this is safe.
     import messaging
 
+    failed_model = payload.get("model")
     try:
         result = await query_ollama(payload, timeout=timeout)
         LAST_CHAT_BACKEND = "cloud"
         return result
     except Exception as cloud_err:
-        print(f"[FALLBACK] Cloud model '{payload.get('model')}' failed ({cloud_err}); "
+        if fallback_model and fallback_model != failed_model:
+            print(f"[FALLBACK] Model '{failed_model}' failed ({cloud_err}); "
+                  f"falling back to main model '{fallback_model}'.")
+            if channel is not None:
+                try:
+                    await messaging.send_chunked(
+                        channel,
+                        f"⚠️ `{failed_model}` is unavailable right now — "
+                        f"falling back to the main model `{fallback_model}`..."
+                    )
+                except Exception:
+                    pass
+            main_payload = dict(payload)
+            main_payload["model"] = fallback_model
+            try:
+                result = await query_ollama(main_payload, timeout=timeout, retries=1)
+                LAST_CHAT_BACKEND = "cloud"
+                return result
+            except Exception as main_err:
+                cloud_err = main_err
+                failed_model = fallback_model
+
+        print(f"[FALLBACK] Cloud model '{failed_model}' failed ({cloud_err}); "
               f"falling back to local model '{config.LOCAL_FALLBACK_MODEL}'.")
         if channel is not None:
             try:
                 await messaging.send_chunked(
                     channel,
-                    f"⚠️ Cloud model (`{payload.get('model')}`) is unavailable right now — "
+                    f"⚠️ Cloud model (`{failed_model}`) is unavailable right now — "
                     f"falling back to local model `{config.LOCAL_FALLBACK_MODEL}`..."
                 )
             except Exception:

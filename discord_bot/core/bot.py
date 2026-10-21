@@ -205,6 +205,60 @@ async def on_message(message):
         await message.channel.send(f"🧹 Cleared {cleared} message(s).", delete_after=5)
         return
 
+    if trigger == "!model" or trigger.startswith("!model "):
+        # Owner-only, like !allowlist / !clear. Thread-only: the main channel
+        # always uses config.MODEL_NAME and has no override.
+        if user_id != config.DISCORD_USER_ID:
+            await messaging.send_chunked(message.channel, "🔒 Only the bot owner can change the model.")
+            return
+        if not isinstance(message.channel, discord.Thread):
+            await messaging.send_chunked(
+                message.channel,
+                f"⚠️ `!model` only works inside a thread — the main channel always uses the "
+                f"default model (`{config.MODEL_NAME}`)."
+            )
+            return
+
+        # Use the original text (not the lowercased trigger) so model names keep their case.
+        arg = user_query.strip()[len("!model"):].strip()
+        default_model = config.MODEL_NAME
+
+        if not arg:
+            current = memory_store.get_thread_model_override(message.channel.id)
+            if current:
+                text = f"This thread is using `{current}` (override). Default: `{default_model}`."
+            else:
+                text = f"This thread is using the default model, `{default_model}`."
+        elif arg.lower() == "reset":
+            if memory_store.clear_thread_model_override(message.channel.id):
+                text = f"↩️ This thread is back on the default model (`{default_model}`)."
+            else:
+                text = f"This thread already uses the default model (`{default_model}`)."
+        elif any(ch.isspace() for ch in arg):
+            text = "Usage: `!model` (show), `!model <model name>` (set for this thread), or `!model reset`."
+        elif arg == default_model:
+            # Same as the default: store nothing, so the thread keeps following
+            # MODEL_NAME if it's changed in .env later.
+            memory_store.clear_thread_model_override(message.channel.id)
+            text = f"This thread is using the default model, `{default_model}` (no override set)."
+        else:
+            known = await llm.ollama_model_known(arg)
+            memory_store.set_thread_model_override(message.channel.id, arg)
+            text = f"🧠 This thread now uses `{arg}` (default is `{default_model}`)."
+            if known is False:
+                text += (
+                    f"\n⚠️ I couldn't find `{arg}` in Ollama's model list — saved it anyway "
+                    "(cloud models often don't show up there). If it fails, I'll fall back to "
+                    f"`{default_model}`."
+                )
+            elif known is None:
+                text += (
+                    "\n⚠️ I couldn't check Ollama's model list, so I can't confirm that name exists. "
+                    f"If it fails, I'll fall back to `{default_model}`."
+                )
+        await messaging.send_chunked(message.channel, text)
+        return
+
     if trigger in ("!briefing on", "!briefing off", "!briefing status"):
         if trigger == "!briefing on":
             scheduler.MORNING_BRIEFING_ENABLED = True
@@ -503,6 +557,9 @@ async def on_message(message):
         "!consolidate to manually summarize related facts within a topic into shorter entries right away "
         "(this is lossy — minor details may be trimmed to actually save tokens), "
         "or !consolidate preview to see what !consolidate would do first without changing anything. "
+        "If the user asks how to change which model you run on, tell them that inside a thread the bot owner "
+        "can type !model to see the thread's model, !model <name> to switch just that thread, or !model reset "
+        "to go back to the default; the main channel always uses the default model. "
         "When a request needs more than one piece of information, plan to call multiple tools in "
         "sequence (e.g. look something up before acting on it) rather than stopping after the first result."
         r" You are strictly forbidden from using LaTeX formatting. Do not use dollar signs ($) unless it is used in currency. "
@@ -547,17 +604,25 @@ async def on_message(message):
     ACTIVE_TASKS[user_id] = asyncio.current_task()
     relevant_tools = await embeddings.select_relevant_tools(user_query)
 
+    # A thread's !model override if it has one, else config.MODEL_NAME (always
+    # the case in the main channel). If the override model fails, query_llm
+    # falls back to the main model first, then the local fallback.
+    active_model = memory_store.get_channel_model(message.channel)
+    fallback_model = config.MODEL_NAME if active_model != config.MODEL_NAME else None
+
     try:
         async with message.channel.typing():
             while running and loop_count < max_loops:
                 payload = {
-                    "model": config.MODEL_NAME,
+                    "model": active_model,
                     "messages": messages,
                     "tools": relevant_tools,
                     "stream": False
                 }
 
-                response = await llm.query_llm(payload, timeout=90, channel=message.channel)
+                response = await llm.query_llm(
+                    payload, timeout=90, channel=message.channel, fallback_model=fallback_model
+                )
                 message_data = response.get("message", {})
 
                 if "tool_calls" in message_data and message_data["tool_calls"]:
@@ -627,8 +692,10 @@ async def on_message(message):
                     "content": "You've hit your tool-call limit. Summarize what you found so far for the user."
                 })
                 try:
-                    summary_payload = {"model": config.MODEL_NAME, "messages": messages, "stream": False}
-                    summary_response = await llm.query_llm(summary_payload, timeout=90, channel=message.channel)
+                    summary_payload = {"model": active_model, "messages": messages, "stream": False}
+                    summary_response = await llm.query_llm(
+                        summary_payload, timeout=90, channel=message.channel, fallback_model=fallback_model
+                    )
                     summary_text = summary_response.get("message", {}).get(
                         "content", "⚠️ Hit my execution limit without a clear answer."
                     )

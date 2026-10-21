@@ -229,6 +229,14 @@ def _get_memory_conn() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thread_models (
+            channel_id TEXT PRIMARY KEY,
+            model TEXT NOT NULL
+        )
+        """
+    )
     # Additive migration for DBs created before these columns existed.
     # ADD COLUMN has no "IF NOT EXISTS" in SQLite, so this just no-ops with
     # an OperationalError ("duplicate column") on every run after the first.
@@ -366,6 +374,57 @@ def _set_last_thread_suggestion(channel_id, history_length: int):
         conn.commit()
     finally:
         conn.close()
+
+
+# --- per-thread model override (set manually with !model, thread-only) ---
+# Only ever consulted for discord.Thread channels. The main channel has no
+# row here and always resolves to config.MODEL_NAME. New threads (including
+# ones created by maybe_suggest_thread) never inherit a row — an override is
+# created only by an explicit !model in that thread.
+
+def get_thread_model_override(channel_id) -> "str | None":
+    conn = _get_memory_conn()
+    try:
+        row = conn.execute(
+            "SELECT model FROM thread_models WHERE channel_id = ?", (str(channel_id),)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def set_thread_model_override(channel_id, model: str):
+    conn = _get_memory_conn()
+    try:
+        conn.execute(
+            "INSERT INTO thread_models (channel_id, model) VALUES (?, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET model = excluded.model",
+            (str(channel_id), model),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_thread_model_override(channel_id) -> bool:
+    """Returns True if there was an override to remove."""
+    conn = _get_memory_conn()
+    try:
+        cur = conn.execute("DELETE FROM thread_models WHERE channel_id = ?", (str(channel_id),))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_channel_model(channel) -> str:
+    """The chat model to use for this channel: a thread's !model override if it
+    has one, otherwise config.MODEL_NAME (always the case for the main channel)."""
+    if isinstance(channel, discord.Thread):
+        override = get_thread_model_override(channel.id)
+        if override:
+            return override
+    return config.MODEL_NAME
 
 
 # --- embedding helpers (shared by facts AND topic labels) ---
