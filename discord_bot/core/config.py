@@ -28,7 +28,7 @@ GEMINI_EMBED_API = (
 # already talks to for chat, and the same model rag_knowledge.py uses.
 LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "nomic-embed-text")
 LOCAL_EMBED_API = os.getenv("LOCAL_EMBED_API", "http://localhost:11434/api/embeddings")
-TOOL_TOP_K = int(os.getenv("TOOL_TOP_K", 12))
+TOOL_TOP_K = int(os.getenv("TOOL_TOP_K", 5))
 # Tools always sent regardless of relevance — cheap insurance for stuff the
 # model reaches for constantly or that a bad embedding match shouldn't hide.
 CORE_TOOLS = {"jot_down", "set_reminder", "search_knowledge"}
@@ -36,6 +36,14 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_CHANNEL_ID = int(os.getenv("ALLOWED_CHANNEL_ID", 0))
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID")  # Load default user ID from .env
 LOCAL_FALLBACK_MODEL = os.getenv("LOCAL_FALLBACK_MODEL", "aliafshar/gemma3-it-qat-tools:1b")
+# Sampling/context options sent ONLY to local models (never to *:cloud models).
+# Low temperature makes small models far more consistent at picking tools and
+# filling arguments. num_ctx must hold the system prompt + facts + history +
+# tool schemas; on a 4GB GPU pair 8192 with OLLAMA_KV_CACHE_TYPE=q8_0 and
+# OLLAMA_FLASH_ATTENTION=1 on the Ollama server, and drop to 4096 if
+# `ollama ps` shows the model spilling onto the CPU.
+LOCAL_TEMPERATURE = float(os.getenv("LOCAL_TEMPERATURE", 0.2))
+LOCAL_NUM_CTX = int(os.getenv("LOCAL_NUM_CTX", 8192))
 
 # Base directories other core/ modules build their storage paths from, e.g.
 # config.DATA_DIR / "reminders.json". Centralized here so the data/debug

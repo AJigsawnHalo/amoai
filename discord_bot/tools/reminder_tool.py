@@ -52,28 +52,17 @@ def set_reminder(
     action_args_json: str = None,
 ) -> str:
     """
-    Saves a reminder for the user. Can just ping them with a message, or —
-    if action_tool is given — actually RUN another one of your tools when it
-    comes due and report the result. Use this for requests like "turn on the
-    AC after 30 mins", "restart the server at 11pm", or "when I get home,
-    turn off the porch light": pick the right tool from your own tool list
-    for the action, and schedule it here instead of calling it immediately.
-    Requires an actual time, delay, or arrival zone — if the user just wants
-    something jotted down with no trigger attached ("jot this down: buy
-    milk"), that's jot_down instead, not this tool.
+    Saves a reminder that fires after a delay, at a clock time, or when the user arrives somewhere. Can also run another tool when it fires instead of just pinging.
+    Needs a time, delay, or arrival zone. A note with no trigger ("jot this down") is jot_down, not this tool.
+    Examples: "remind me in 20 min", "at 9pm", "when I get home", "turn on the AC in 30 min" (use action_tool).
 
-    Firing can be time-based (a delay or an absolute date/time) or
-    arrival-based (fires next time Home Assistant reports the user entered a
-    given zone).
-
-    :param user_id: The Discord user ID of the person to be reminded / on whose behalf the action runs.
-    :param message: A short human-readable label for what this reminder is about (e.g. 'Do laundry', 'Turn on the AC'). Always required, even for action reminders — it's shown to the user.
-    :param minutes_from_now: Preferred for anything relative ("in 20 minutes", "in 2 hours", "in a couple days"). Convert the request to a plain number of minutes yourself and pass it here — do NOT also compute an absolute target_time_iso for a relative request, and do not use both params at once.
-    :param target_time_iso: Only for an explicit calendar date/time ("at 9pm", "next Tuesday at 3pm", "on August 5th"). Build this from the "Current date and time" given to you in the system prompt — never guess or invent the current date/year. If you omit the UTC offset, it's interpreted as GMT+8 (the bot's home timezone), so for a plain local time like "9pm tonight" just write it without an offset, e.g. '2026-07-21T21:00:00' — do not add 'Z' or a UTC offset unless the user explicitly gave you one.
-    :param on_arrival: Optional. If true, ignores the time params entirely and instead fires the next time the user is detected entering the given zone.
-    :param zone: Optional, only used with on_arrival. The Home Assistant zone name to watch for (e.g. 'home', 'gym', 'office'). Defaults to 'home'. Must match the zone name reported by the arrival webhook.
-    :param action_tool: Optional. The exact name of another tool you have access to (e.g. a Home Assistant control tool). If given, that tool is actually called when this reminder fires, instead of just sending a plain ping. Omit for a plain reminder.
-    :param action_args_json: Optional, only used with action_tool. A JSON object (as a string) of the arguments to pass to that tool, using its exact parameter names — e.g. '{"entity": "ac", "state": "on"}'. Do NOT include user_id here; it's added automatically if the tool needs it. Use '{}' if the tool takes no arguments.
+    :param message: Short label for the reminder, e.g. 'Do laundry'. Always required.
+    :param minutes_from_now: For relative times ("in 2 hours" = 120). Use this OR target_time_iso, never both.
+    :param target_time_iso: Only for an explicit date/time. ISO format built from the current date in the system prompt, with no UTC offset and no 'Z' for local time, e.g. '2026-07-21T21:00:00'. Never guess the date.
+    :param on_arrival: True to fire the next time the user arrives at the zone, ignoring the time params.
+    :param zone: Only with on_arrival. Home Assistant zone name such as 'home' or 'gym'. Default 'home'.
+    :param action_tool: Exact name of another tool to run when the reminder fires, e.g. 'ha_turn_on'. Omit for a plain reminder.
+    :param action_args_json: Only with action_tool. JSON object string of that tool's arguments, e.g. '{"entity": "ac"}'. Do not include user_id. Use '{}' for none.
     """
     action_args = None
     if action_tool:

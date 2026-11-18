@@ -79,14 +79,14 @@ async def on_ready():
 
     # Wire job_manager to this process's event loop and a way to post
     # results back to Discord when a background job finishes on its own.
-    from tools.job_manager import set_event_loop, set_notifier
-    set_event_loop(asyncio.get_event_loop())
+    from tools.job_manager import _set_event_loop, _set_notifier
+    _set_event_loop(asyncio.get_event_loop())
     if config.ALLOWED_CHANNEL_ID:
         async def _notify_job_channel(text: str):
             channel = bot.get_channel(config.ALLOWED_CHANNEL_ID)
             if channel:
                 await messaging.send_chunked(channel, text)
-        set_notifier(_notify_job_channel)
+        _set_notifier(_notify_job_channel)
 
     # Only announce once per process start — on_ready can fire again on reconnects
     if not _startup_notified:

@@ -84,18 +84,11 @@ def _save_entries(entries: list):
 
 def jot_down(user_id: str, content: str, tag: str = None) -> str:
     """
-    Jots down a short freeform entry straight from the conversation, saved
-    with no time trigger and no source file. Use this for: "jot this down:
-    the wifi password changed", "add to scratchpad: call the plumber
-    tomorrow", "quick note: <thing>". Also covers a bare "remember this:
-    <thing>" that has no clock time, delay, or arrival event attached — if
-    a time or arrival IS attached ("remind me at 5pm", "when I get home"),
-    use set_reminder instead, not this tool. And if the user says "notes"
-    ("based on my notes", "search my notes"), that means the indexed
-    knowledge base — use search_knowledge instead, not this tool.
+    Saves a quick freeform note with no time trigger. Use for "jot this down: ...", "add to scratchpad: ...", "note that ...", or "remember this: ..." when no time or arrival is attached.
+    If a time or arrival IS attached ("remind me at 5pm", "when I get home"), use set_reminder. If the user means searching their notes ("based on my notes", "search my notes"), use search_knowledge.
 
     :param content: The text of the entry itself.
-    :param tag: Optional short label to group related entries (e.g. 'shopping', 'ideas'). Omit if the user doesn't give one.
+    :param tag: Optional short label such as 'shopping' or 'ideas'. Omit if the user gave none.
     """
     if not content or not content.strip():
         return "❌ Error: entry content can't be empty."

@@ -132,8 +132,8 @@ def register_tools():
 
 register_tools()
 
-from tools.job_manager import set_tool_registry
-set_tool_registry(TOOL_REGISTRY)
+from tools.job_manager import _set_tool_registry
+_set_tool_registry(TOOL_REGISTRY)
 
 # --- TOOL CALL AUDIT LOG ---
 TOOL_LOG_FILE = config.DATA_DIR / "tool_call_log.jsonl"

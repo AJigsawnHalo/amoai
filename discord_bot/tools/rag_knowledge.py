@@ -303,20 +303,11 @@ def index_knowledge_base(path: str) -> str:
 
 def search_knowledge(query: str, top_k: int = 5) -> str:
     """
-    Searches the indexed knowledge base (markdown notes, code snippets, PDFs)
-    for passages most relevant to the query and returns them with their
-    source file. This is the canonical tool for "based on my notes" and
-    "search my notes" — "notes" used as a NOUN (my notes, search my notes,
-    what do my notes say) ALWAYS refers to this indexed knowledge base,
-    never scratchpad_tool.py's entries, even if the user jotted something
-    down earlier in the same conversation.
+    Searches the user's indexed knowledge base (markdown notes, code snippets, PDFs) and returns the most relevant passages with their source file. Use for "based on my notes", "search my notes", "what do my notes say about X", or recalling anything from indexed docs.
+    "Notes" as a noun means this knowledge base, not the scratchpad. "Note that X" or "make a note of X" is a request to save something: use jot_down instead.
 
-    "Notes" used as a VERB ("note that X", "make a note of X") is NOT this
-    tool — that's jot_down in scratchpad_tool.py instead, saving X verbatim
-    rather than searching anything. Use search_knowledge whenever the user
-    asks to recall, find, look up, search, or reference something from
-    previously indexed notes, docs, or code — never just because the word
-    "note" appears somewhere in the message.
+    :param query: What to look for, in the user's own words.
+    :param top_k: Number of passages to return. Default 5.
     """
     conn = _get_conn()
     rows = conn.execute("SELECT source, chunk_index, content, embedding FROM chunks").fetchall()

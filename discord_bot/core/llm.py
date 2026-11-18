@@ -72,7 +72,26 @@ def _extract_masked_error(data: dict) -> "str | None":
     return None
 
 
+def _is_cloud_model(name: "str | None") -> bool:
+    """Ollama cloud models are tagged \"...:cloud\" or \"...-cloud\"."""
+    tag = (name or "").rsplit(":", 1)[-1]
+    return tag == "cloud" or tag.endswith("-cloud")
+
+
+def _with_local_options(payload: dict) -> dict:
+    """Adds low-temperature / fixed-context options for local models only.
+    Cloud payloads are returned untouched, and an explicit \"options\" key
+    already on the payload always wins."""
+    if _is_cloud_model(payload.get("model")) or "options" in payload:
+        return payload
+    return {
+        **payload,
+        "options": {"temperature": config.LOCAL_TEMPERATURE, "num_ctx": config.LOCAL_NUM_CTX},
+    }
+
+
 async def query_ollama(payload: dict, timeout: int = 90, retries: int = 2) -> dict:
+    payload = _with_local_options(payload)
     session = await get_session()
     last_err = None
     for attempt in range(retries + 1):

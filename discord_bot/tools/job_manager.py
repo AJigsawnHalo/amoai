@@ -14,14 +14,14 @@ recurring job (see bot.py's register_job/SCHEDULED_JOBS), not here. This
 is for "run once, for a while, then report back."
 
 --- Wiring required in bot.py (see that file for the actual lines) ---
-    from tools.job_manager import set_event_loop, set_notifier, set_tool_registry
-    set_tool_registry(TOOL_REGISTRY)   # right after register_tools() runs
-    set_event_loop(asyncio.get_event_loop())   # in on_ready
-    set_notifier(lambda text: send_chunked(bot.get_channel(ALLOWED_CHANNEL_ID), text))   # in on_ready
+    from tools.job_manager import _set_event_loop, _set_notifier, _set_tool_registry
+    _set_tool_registry(TOOL_REGISTRY)   # right after register_tools() runs
+    _set_event_loop(asyncio.get_event_loop())   # in on_ready
+    _set_notifier(lambda text: send_chunked(bot.get_channel(ALLOWED_CHANNEL_ID), text))   # in on_ready
 
-Without set_event_loop/set_notifier, start_job() will raise and a finished
+Without _set_event_loop/_set_notifier, _start_job() will raise and a finished
 job's completion message won't be able to reach Discord. Without
-set_tool_registry, watch_tool() won't be able to look up any tools to poll.
+_set_tool_registry, watch_tool() won't be able to look up any tools to poll.
 """
 
 import asyncio
@@ -70,19 +70,19 @@ _WATCHABLE_TOOLS = {
 }
 
 
-def set_event_loop(loop):
+def _set_event_loop(loop):
     global _EVENT_LOOP
     _EVENT_LOOP = loop
 
 
-def set_tool_registry(registry: dict):
+def _set_tool_registry(registry: dict):
     """Called once from bot.py, right after register_tools() populates
     TOOL_REGISTRY, so watch_tool can look up any other tool by name."""
     global _TOOL_REGISTRY
     _TOOL_REGISTRY = registry
 
 
-def set_notifier(notifier):
+def _set_notifier(notifier):
     """notifier: an async callable taking a single str, used to post a
     job's result back to Discord when it finishes on its own (success,
     failure, or being stopped)."""
@@ -116,7 +116,7 @@ async def _run_job(job_id: str, coro):
         await _notify(f"⚠️ **{_JOBS[job_id]['description']}** failed: {e}")
 
 
-def start_job(description: str, coro) -> str:
+def _start_job(description: str, coro) -> str:
     """Schedules `coro` as a background job on the bot's event loop and
     registers it for tracking. Call this from other tool modules to add
     new job types (see watch_container below for an example) — it's
@@ -125,7 +125,7 @@ def start_job(description: str, coro) -> str:
     Returns the new job's id."""
     if _EVENT_LOOP is None:
         raise RuntimeError(
-            "job_manager.set_event_loop() was never called — "
+            "job_manager._set_event_loop() was never called — "
             "is this running inside the bot process?"
         )
     job_id = _new_job_id()
@@ -249,7 +249,7 @@ def watch_tool(tool_name: str, minutes: int = 60, interval_seconds: int = 30, to
     except Exception as e:
         return f"Couldn't parse tool_args_json: {e}"
 
-    job_id = start_job(
+    job_id = _start_job(
         f"Watching '{tool_name}' every {interval_seconds}s for {minutes}m",
         _watch_tool_job(tool_name, tool_args, minutes, interval_seconds),
     )
@@ -295,7 +295,7 @@ def run_after_delay(tool_name: str, delay_minutes: float, tool_args_json: str = 
     except Exception as e:
         return f"Couldn't parse tool_args_json: {e}"
 
-    job_id = start_job(
+    job_id = _start_job(
         f"Running '{tool_name}' after {delay_minutes}m delay",
         _delayed_job(tool_name, tool_args, delay_minutes),
     )
@@ -381,7 +381,7 @@ def watch_until(tool_name: str, condition: str, minutes: int = 60, interval_seco
     except Exception as e:
         return f"Couldn't parse tool_args_json: {e}"
 
-    job_id = start_job(
+    job_id = _start_job(
         f'Watching \'{tool_name}\' until "{condition}" (up to {minutes}m)',
         _watch_until_job(tool_name, tool_args, condition, minutes, interval_seconds),
     )
