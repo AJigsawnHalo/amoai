@@ -17,7 +17,7 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 
 # --- CONFIGURATION ---
-MODEL_NAME = "gemma3:1b"  # Baked in: Smarter context window & reasoning for email digestion
+MODEL_NAME = "phi4-mini:latest"  # Baked in: Smarter context window & reasoning for email digestion
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")  # Kept in .env
 
 # Optional .env override; otherwise the MODEL_NAME set above is used.
