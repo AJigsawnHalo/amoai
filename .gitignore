@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.bak
+*.orig
+*classify_test.py
+model-test*
