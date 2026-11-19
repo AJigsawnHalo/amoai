@@ -311,7 +311,33 @@ def run_after_delay(tool_name: str, delay_minutes: float, tool_args_json: str = 
 # rather than raw diffing (watch_tool) or persona chat (the main model).
 
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
-JOB_CLASSIFIER_MODEL = os.getenv("JOB_CLASSIFIER_MODEL", "gpt-oss:20b-cloud")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_CHAT_API = os.getenv(
+    "GEMINI_CHAT_API",
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+)
+
+
+def _is_gemini_model(name: str) -> bool:
+    n = (name or "").strip().lower()
+    return ":" not in n and (n.startswith("gemini-") or n.startswith("gemma-"))
+
+
+def _is_cloud_model(name: str) -> bool:
+    tag = (name or "").rsplit(":", 1)[-1]
+    return tag == "cloud" or tag.endswith("-cloud")
+
+
+# Gemma 4 on the Gemini API: tiny prompts fit its 16K tokens/min cap, and its
+# 14.4K requests/day free quota is separate from the chat models'. Without a
+# Gemini key, fall back to the local model. Ollama *:cloud names no longer work,
+# so an old value left in .env is ignored.
+_JOB_DEFAULT = "gemma-4-31b-it" if GEMINI_API_KEY else os.getenv(
+    "LOCAL_FALLBACK_MODEL", "aliafshar/gemma3-it-qat-tools:1b")
+JOB_CLASSIFIER_MODEL = os.getenv("JOB_CLASSIFIER_MODEL") or _JOB_DEFAULT
+if _is_cloud_model(JOB_CLASSIFIER_MODEL):
+    print(f"[JOBS] JOB_CLASSIFIER_MODEL '{JOB_CLASSIFIER_MODEL}' is an Ollama cloud model; using '{_JOB_DEFAULT}'.")
+    JOB_CLASSIFIER_MODEL = _JOB_DEFAULT
 
 
 def _condition_met(tool_output: str, condition: str) -> bool:
@@ -322,16 +348,30 @@ Condition to check: {condition}
 
 Has this condition been met, based on the tool output above? Respond with
 ONLY "YES" or "NO". No other text."""
-    payload = {
-        "model": JOB_CLASSIFIER_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "options": {"temperature": 0.1, "num_ctx": 1024},
-    }
     try:
-        r = requests.post(OLLAMA_API, json=payload, timeout=30)
-        r.raise_for_status()
-        text = r.json().get("message", {}).get("content", "").strip().lower()
+        if _is_gemini_model(JOB_CLASSIFIER_MODEL):
+            r = requests.post(
+                GEMINI_CHAT_API,
+                headers={"Authorization": f"Bearer {GEMINI_API_KEY}"},
+                json={
+                    "model": JOB_CLASSIFIER_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            text = (r.json()["choices"][0]["message"].get("content") or "").strip().lower()
+        else:
+            payload = {
+                "model": JOB_CLASSIFIER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": 0.1, "num_ctx": 1024},
+            }
+            r = requests.post(OLLAMA_API, json=payload, timeout=30)
+            r.raise_for_status()
+            text = r.json().get("message", {}).get("content", "").strip().lower()
         return text.startswith("yes")
     except Exception:
         return False  # classifier unreachable — treat as "not met yet", not a false trigger
@@ -340,9 +380,16 @@ ONLY "YES" or "NO". No other text."""
 async def _watch_until_job(tool_name: str, tool_args: dict, condition: str, minutes: int, interval_seconds: int) -> str:
     func = _TOOL_REGISTRY[tool_name]
     deadline = time.monotonic() + minutes * 60
+    last_output = None
     while time.monotonic() < deadline:
         output = await asyncio.to_thread(func, **tool_args)
-        met = await asyncio.to_thread(_condition_met, output, condition)
+        # Same output as the previous poll means the earlier "not met" verdict
+        # still stands — skip the model call (saves quota / GPU time).
+        if output == last_output:
+            met = False
+        else:
+            met = await asyncio.to_thread(_condition_met, output, condition)
+            last_output = output
         if met:
             return f'Condition met: "{condition}"\n\nLatest `{tool_name}` output:\n{output}'
         await asyncio.sleep(interval_seconds)

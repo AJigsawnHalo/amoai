@@ -14,11 +14,22 @@ from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
 
-MODEL_NAME = os.getenv("MODEL_NAME") or "gemma4:cloud"
-VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME") or "gemma4:cloud"
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-001")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Gemini chat goes through Google's OpenAI-compatible endpoint. A model name with
+# no ":" that starts with "gemini-" or "gemma-" is routed here (see
+# llm.is_gemini_model); everything else (e.g. "llama3.2:3b") goes to Ollama.
+GEMINI_CHAT_API = os.getenv(
+    "GEMINI_CHAT_API",
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+)
+GEMINI_MODELS_API = "https://generativelanguage.googleapis.com/v1beta/models/{model}"
+# Tried in order when a Gemini chat model is rate limited (429) or errors. Each
+# model has its own free-tier quota, so a sibling is a cheap second bucket.
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite").split(",") if m.strip()
+]
 GEMINI_EMBED_API = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{{model}}:embedContent"
 )
@@ -36,6 +47,10 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_CHANNEL_ID = int(os.getenv("ALLOWED_CHANNEL_ID", 0))
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID")  # Load default user ID from .env
 LOCAL_FALLBACK_MODEL = os.getenv("LOCAL_FALLBACK_MODEL", "aliafshar/gemma3-it-qat-tools:1b")
+# Main chat model. With a Gemini key the default is Flash-Lite (500 requests/day
+# on the free tier); without one it is the local fallback model.
+MODEL_NAME = os.getenv("MODEL_NAME") or ("gemini-3.5-flash-lite" if GEMINI_API_KEY else LOCAL_FALLBACK_MODEL)
+VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME") or MODEL_NAME
 # Sampling/context options sent ONLY to local models (never to *:cloud models).
 # Low temperature makes small models far more consistent at picking tools and
 # filling arguments. num_ctx must hold the system prompt + facts + history +

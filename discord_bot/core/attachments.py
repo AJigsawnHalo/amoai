@@ -255,8 +255,8 @@ async def describe_images_for_tools(images_b64: "list[str]", user_query: str, ch
         print(f"[VISION] Image description pass failed: {e}")
         return None
 
-    if llm.LAST_CHAT_BACKEND != "cloud":
-        # Fell back to the local model, which can't see images either —
+    if llm.LAST_MODEL_USED == config.LOCAL_FALLBACK_MODEL:
+        # Fell back to the local fallback model, which can't see images either —
         # query_llm already strips "images" before that call, so a
         # "successful" local response here would just be a hallucination.
         return None

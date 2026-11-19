@@ -37,7 +37,9 @@ MIN_PRIORITY = os.getenv("CRITICAL_MIN_PRIORITY", "err")  # anything <= this is 
 # Optional LLM classification (mirrors monitor.py's classify_email) for
 # plain-text log sources that have no structured priority field.
 USE_LLM_CLASSIFICATION = os.getenv("USE_LLM_CLASSIFICATION", "false").strip().lower() == "true"
-MODEL_NAME = os.getenv("LOG_MONITOR_MODEL", "gpt-oss:20b-cloud")
+MODEL_NAME = os.getenv("LOG_MONITOR_MODEL") or "gemma3:1b"
+if MODEL_NAME.rsplit(":", 1)[-1] == "cloud" or MODEL_NAME.endswith("-cloud"):
+    MODEL_NAME = "gemma3:1b"  # Ollama cloud models no longer work; this path is local-only
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")
 
 # Regex net for critical events regardless of source/priority. Extend via

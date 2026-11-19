@@ -269,18 +269,18 @@ async def on_message(message):
             memory_store.clear_thread_model_override(message.channel.id)
             text = f"This thread is using the default model, `{default_model}` (no override set)."
         else:
-            known = await llm.ollama_model_known(arg)
+            known = await llm.model_known(arg)
             memory_store.set_thread_model_override(message.channel.id, arg)
             text = f"🧠 This thread now uses `{arg}` (default is `{default_model}`)."
             if known is False:
                 text += (
-                    f"\n⚠️ I couldn't find `{arg}` in Ollama's model list — saved it anyway "
-                    "(cloud models often don't show up there). If it fails, I'll fall back to "
+                    f"\n⚠️ I couldn't find `{arg}` in the model list — saved it anyway "
+                    "(some models don't show up there). If it fails, I'll fall back to "
                     f"`{default_model}`."
                 )
             elif known is None:
                 text += (
-                    "\n⚠️ I couldn't check Ollama's model list, so I can't confirm that name exists. "
+                    "\n⚠️ I couldn't check the model list, so I can't confirm that name exists. "
                     f"If it fails, I'll fall back to `{default_model}`."
                 )
         await messaging.send_chunked(message.channel, text)
