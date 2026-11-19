@@ -17,7 +17,7 @@ from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 
 # --- CONFIGURATION ---
-MODEL_NAME = "phi4-mini:latest"  # Baked in: Smarter context window & reasoning for email digestion
+MODEL_NAME = "gemma3:1b"  # Baked in: Smarter context window & reasoning for email digestion
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/chat")  # Kept in .env
 
 # Optional .env override; otherwise the MODEL_NAME set above is used.
@@ -124,15 +124,24 @@ def classify_email(subject, sender, snippet):
     """Uses LLM to classify emails into newsletter, important, or ignore.
     Returns None if the reply is unusable (caller leaves the mail untouched).
     Raises LLMUnavailable if the model can't be reached."""
-    prompt = f"""Classify this email into exactly one of three categories: "newsletter", "important", or "ignore".
-Sender: {sender}
+    prompt = f"""You sort email for one person. Answer with exactly one word: important, newsletter, or ignore.
+
+important = written by a real person or a support/work team to the reader: replies, questions, status updates on something the reader raised, work, money, security alerts, deadlines. A reply in an ongoing conversation is important even if no action is needed.
+newsletter = marketing, promotions, digests, announcements, "someone is live" or "new video" alerts, anything mass-mailed.
+ignore = ONLY clearly automated mail that needs no attention: receipts, shipping updates, system alerts, and social media notifications (likes, follows, comments, tags).
+Automated mail from an app or website is never important, except security or payment alerts. If you truly cannot tell who sent it, answer important.
+
+Examples:
+"Thanks, got your message. I'll review it tomorrow." -> important
+"Your order has shipped." -> ignore
+"50% off this weekend only!" -> newsletter
+"Jake commented on your post." -> ignore
+"New video from a channel you subscribe to." -> newsletter
+
+From: {sender}
 Subject: {subject}
 Preview: {snippet}
-Rules:
-- newsletter: marketing emails, promotions, digests, announcements, subscription content, no-reply addresses, anything with unsubscribe links, livestream notifications
-- important: personal messages requiring attention, work-related emails, financial transactions, security alerts, direct replies from real people, anything time-sensitive
-- ignore: automated notifications you don't need to act on (order confirmations, shipping updates, social media notifications, calendar invites you already know about, system alerts, receipts)
-Respond with ONLY one word: newsletter, important, or ignore"""
+Answer:"""
     messages = [{"role": "user", "content": prompt}]
     result = query_llm(messages, options={"temperature": 0.1, "num_ctx": LLM_NUM_CTX}, timeout=CLASSIFY_TIMEOUT)
     cleaned = clean_llm_response(result)
